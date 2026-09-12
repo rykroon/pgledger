@@ -1,0 +1,5 @@
+# pgledger extension
+comment = 'Double-entry ledger for Postgres, inspired by TigerBeetle'
+default_version = '0.0.1'
+relocatable = false
+superuser = false
