@@ -4,8 +4,7 @@ A double-entry ledger for Postgres, packaged as a Trusted Language Extension (TL
 Inspired by [TigerBeetle](https://tigerbeetle.com/).
 
 Every transfer moves value from a credit account to a debit account, and both sides are
-recorded. Nothing is ever updated or deleted — accounts, transfers, and balances are all
-append-only, so the full history stays readable.
+recorded. Nothing is ever updated or deleted — ledgers, accounts, transfers, and balances are all append-only, so the full history stays readable.
 
 ## Install
 
@@ -17,32 +16,41 @@ This creates a `ledger` schema holding the extension's objects.
 
 ## Usage
 
-Every ledger has one **issuer** (an account with a `NULL` external_user_id) whose balance
-is the outstanding supply, plus one account per user. Ids are UUIDv7 values supplied by
-the application.
+A ledger holds accounts in a single unit of value, such as a currency, points, or inventory.
+The extension doesn't dictate how you structure them: you tell accounts apart with your own
+`code`s and `external_id`, and choose a balance rule for each one.
 
-Create a ledger's accounts:
+Create a ledger:
 
 ```sql
--- the issuer: its supply cannot go negative
-INSERT INTO ledger.accounts (id, ledger_id, external_user_id, require_credit_balance)
-VALUES ('...issuer-id...', '...ledger-id...', NULL, true);
-
--- a user: cannot be overdrawn
-INSERT INTO ledger.accounts (id, ledger_id, external_user_id, require_debit_balance)
-VALUES ('...user-id...', '...ledger-id...', '...external-user-id...', true);
+INSERT INTO ledger.ledgers (id) VALUES ('...ledger-id...');
 ```
 
-Post a transfer. Value flows credit -> debit, so granting a user funds debits the user
-and credits the issuer:
+`ledger.ledgers` is intentionally bare. Keep mutable attributes such as a name in your own
+table keyed by `ledger_id uuid PRIMARY KEY REFERENCES ledger.ledgers(id)`.
+
+Create accounts. Each account may optionally restrict which side its balance can be on:
 
 ```sql
-INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount)
-VALUES ('...transfer-id...', '...ledger-id...', '...user-id...', '...issuer-id...', 100);
+-- cash (code 1 in this example): debit-normal, cannot go below zero
+INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance)
+VALUES ('...cash-id...', '...ledger-id...', 1, true);
+
+-- revenue (code 2): credit-normal, cannot go below zero
+INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
+VALUES ('...revenue-id...', '...ledger-id...', 2, true);
+```
+
+Post a transfer. Value flows credit -> debit, so recording a sale debits cash and credits
+revenue:
+
+```sql
+INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount, code)
+VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id...', 100, 1);
 ```
 
 A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
-and enforces the overdraft rules. Batch transfers by posting them as a single `INSERT` —
+and enforces the balance rules. Batch transfers by posting them as a single `INSERT` —
 they are applied in `id` order.
 
 Read balances:
@@ -51,14 +59,52 @@ Read balances:
 SELECT account_id, balance FROM ledger.current_balances WHERE ledger_id = '...ledger-id...';
 ```
 
-`balance` is debits minus credits, so users read positive and the issuer reads negative.
-A ledger always sums to zero.
+`balance` is debits minus credits, so debit-normal accounts read positive and credit-normal
+accounts read negative. Every transfer adds the same amount to both sides, so a ledger always
+sums to zero.
+
+For history, `ledger.account_balances` has one row per account per transfer, holding the
+running `debits_posted` and `credits_posted` after that transfer. `version` counts each
+account's postings from 1 and is their order; join `ledger.transfers` for timestamps:
+
+```sql
+SELECT ab.version, ab.debits_posted - ab.credits_posted AS balance, t.created_at
+FROM ledger.account_balances ab
+JOIN ledger.transfers t ON t.id = ab.transfer_id
+WHERE ab.account_id = '...cash-id...'
+ORDER BY ab.version;
+```
+
+## Balance rules
+
+- `require_debit_balance`: the account's credits may never exceed its debits.
+- `require_credit_balance`: the account's debits may never exceed its credits.
+- Neither: the balance may be on either side.
+
+A transfer that would break a rule is rejected with SQLSTATE `LG001`.
+
+## Your data on accounts and transfers
+
+Accounts and transfers both carry three fields that belong to you. The ledger stores
+them but never interprets them:
+
+- `code` (required, positive integer): a category you define, such as an account type from
+  your chart of accounts or a transfer kind (sale, refund, fee). It doesn't reference any
+  table.
+- `external_id` (optional `uuid`): links the row to something in your system, e.g. a
+  customer, an order, or a group of related transfers.
+- `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
+  date or the original time of an imported record. It doesn't change the order balances
+  are applied in. `created_at` is always set by the ledger to the time of the inserting transaction.
 
 ## Constraints
 
+- Accounts must belong to an existing ledger.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
 - `amount` must be positive.
+- `code` must be positive.
+- Supplying `created_at` raises SQLSTATE `428C9` (`generated_always`).
 - An account can require a debit balance or a credit balance, but not both.
-- A transfer that would break an overdraft rule raises SQLSTATE `LG001`.
+- A transfer that would break a balance rule raises SQLSTATE `LG001`.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables raises
-  `restrict_violation`.
+  `restrict_violation`, and so does inserting into `ledger.account_balances` directly.
