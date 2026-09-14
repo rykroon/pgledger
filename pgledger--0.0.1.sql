@@ -1,8 +1,7 @@
 CREATE SCHEMA ledger;
 
 
--- Makes a table append-only. Statement-level so it also covers TRUNCATE and
--- reports attempts that match no rows.
+-- Makes a table append-only. Statement-level so it also covers TRUNCATE.
 CREATE OR REPLACE FUNCTION ledger.raise_immutable()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -12,23 +11,51 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- A balance on one ledger. A NULL external_user_id marks the ledger's issuer,
--- whose balance is the outstanding supply; otherwise it is a user's balance.
+-- Stamps created_at; callers can't supply it (a generated column can't use now()).
+-- created_at has no DEFAULT, so with this trigger disabled NOT NULL fails inserts.
+CREATE OR REPLACE FUNCTION ledger.set_created_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.created_at IS NOT NULL THEN
+        RAISE EXCEPTION 'ledger.%.created_at is assigned by the ledger and cannot be supplied', TG_TABLE_NAME
+            USING ERRCODE = 'generated_always';
+    END IF;
+    NEW.created_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- A ledger: one unit of value. Deliberately bare; mutable attributes belong in the
+-- caller's own table keyed by ledger_id. Immutable; id is a UUIDv7 from the caller.
+CREATE TABLE ledger.ledgers (
+    id         uuid        PRIMARY KEY,
+    created_at timestamptz NOT NULL
+);
+
+CREATE TRIGGER ledgers_set_created_at
+    BEFORE INSERT ON ledger.ledgers
+    FOR EACH ROW EXECUTE FUNCTION ledger.set_created_at();
+
+CREATE TRIGGER ledgers_immutable
+    BEFORE UPDATE OR DELETE OR TRUNCATE ON ledger.ledgers
+    FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
+
+-- A balance on one ledger. code, external_id and external_timestamp are opaque
+-- caller data; nothing is unique beyond id.
 --
--- ledger_id and external_user_id are opaque ids supplied by the caller. Neither
--- refers to anything this extension owns, and neither is enforced.
+-- The flags are overdraft rules enforced by post_transfer(): require_debit_balance
+-- keeps a user from being overdrawn, require_credit_balance keeps an issuer from
+-- redeeming past what it issued. Both at once would pin the balance to zero.
 --
--- The flags are the overdraft rules, enforced by post_transfer(): a user cannot be
--- overdrawn (require_debit_balance) and the issuer's supply cannot go
--- negative (require_credit_balance). At most one may be set: an account whose
--- balance had to stay on both sides could only ever hold zero.
---
--- Immutable; balances live in account_balances. id is a UUIDv7 from the caller.
+-- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.accounts (
-    id               uuid        PRIMARY KEY,
-    created_at       timestamptz NOT NULL DEFAULT now(),
-    ledger_id        uuid        NOT NULL,
-    external_user_id uuid,
+    id                 uuid        PRIMARY KEY,
+    created_at         timestamptz NOT NULL,
+    ledger_id          uuid        NOT NULL REFERENCES ledger.ledgers(id),
+    code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
+    external_id        uuid,
+    external_timestamp timestamptz,
 
     require_credit_balance boolean NOT NULL DEFAULT false,
     require_debit_balance  boolean NOT NULL DEFAULT false,
@@ -36,33 +63,45 @@ CREATE TABLE ledger.accounts (
     CONSTRAINT accounts_one_balance_requirement
         CHECK (NOT (require_credit_balance AND require_debit_balance)),
 
-    -- One account per user per ledger; NULLS NOT DISTINCT makes it one issuer too.
-    UNIQUE NULLS NOT DISTINCT (ledger_id, external_user_id), -- I dont think we need this
     -- Target of the composite FKs that keep a transfer on one ledger.
     UNIQUE (id, ledger_id)
 );
 
-CREATE INDEX accounts_external_user_id_idx ON ledger.accounts (external_user_id);
+CREATE INDEX accounts_external_id_idx ON ledger.accounts (external_id)
+    WHERE external_id IS NOT NULL;
+
+CREATE TRIGGER accounts_set_created_at
+    BEFORE INSERT ON ledger.accounts
+    FOR EACH ROW EXECUTE FUNCTION ledger.set_created_at();
 
 CREATE TRIGGER accounts_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON ledger.accounts
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
 
--- Value flows credit -> debit: a grant debits the user and credits the issuer; a
--- deduction swaps them. The composite FKs on ledger_id make a cross-ledger
--- transfer unwritable.
+-- Value flows credit -> debit. The composite FKs make a cross-ledger transfer
+-- unwritable. external_timestamp is the caller's own time and changes no ordering.
 --
--- created_at is transaction time; the order transfers were applied is
--- account_balances.applied_at. Immutable; id is a UUIDv7 from the caller.
+-- The close_* flags permanently close that account, which must be left at zero;
+-- only a closing transfer may have a zero amount.
+--
+-- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.transfers (
-    id                uuid          PRIMARY KEY,
-    created_at        timestamptz   NOT NULL DEFAULT now(),
-    ledger_id         uuid          NOT NULL,
-    debit_account_id  uuid          NOT NULL,
-    credit_account_id uuid          NOT NULL,
-    amount            numeric(39,0) NOT NULL CHECK (amount > 0),
+    id                   uuid          PRIMARY KEY,
+    created_at           timestamptz   NOT NULL,
+    ledger_id            uuid          NOT NULL,
+    debit_account_id     uuid          NOT NULL,
+    credit_account_id    uuid          NOT NULL,
+    amount               numeric(39,0) NOT NULL CHECK (amount >= 0),
+    code                 integer       NOT NULL CHECK (code BETWEEN 1 AND 65535),
+    external_id          uuid,
+    external_timestamp   timestamptz,
+    close_debit_account  boolean       NOT NULL DEFAULT false,
+    close_credit_account boolean       NOT NULL DEFAULT false,
 
     CHECK (debit_account_id <> credit_account_id),
+
+    CONSTRAINT transfers_zero_amount_closes
+        CHECK (amount > 0 OR close_debit_account OR close_credit_account),
 
     FOREIGN KEY (debit_account_id, ledger_id)  REFERENCES ledger.accounts (id, ledger_id),
     FOREIGN KEY (credit_account_id, ledger_id) REFERENCES ledger.accounts (id, ledger_id)
@@ -72,37 +111,60 @@ CREATE INDEX transfers_debit_account_id_idx ON ledger.transfers (debit_account_i
 CREATE INDEX transfers_credit_account_id_idx ON ledger.transfers (credit_account_id);
 -- Serves chronological listings of one ledger's transfers.
 CREATE INDEX transfers_ledger_id_created_at_idx ON ledger.transfers (ledger_id, created_at);
+CREATE INDEX transfers_external_id_idx ON ledger.transfers (external_id)
+    WHERE external_id IS NOT NULL;
+
+CREATE TRIGGER transfers_set_created_at
+    BEFORE INSERT ON ledger.transfers
+    FOR EACH ROW EXECUTE FUNCTION ledger.set_created_at();
 
 CREATE TRIGGER transfers_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON ledger.transfers
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
 
--- An account's running totals after each transfer: two rows per transfer, so any
--- past balance is readable. Immutable.
+-- An account's running totals after each transfer, two rows per transfer. Immutable.
 --
--- applied_at comes from clock_timestamp() under the account lock, never from the
--- transfer, because lock order is the chain's order and the transfer's timestamp
--- can disagree with it under concurrency. UNIQUE (account_id, applied_at) enforces
--- that no two postings share a microsecond and serves the latest-balance lookup.
+-- version is previous + 1, assigned under the account lock, so it is gapless and
+-- can't go backwards like a clock. A writer on a stale snapshot computes an
+-- existing version and fails on the primary key instead of forking the chain.
+--
+-- Balance isn't stored: it's the totals' difference, sign left to the reader.
+-- closed is only ever true on an account's last row.
 CREATE TABLE ledger.account_balances (
-    transfer_id    uuid          NOT NULL REFERENCES ledger.transfers(id),
     account_id     uuid          NOT NULL REFERENCES ledger.accounts(id),
+    version        bigint        NOT NULL CHECK (version > 0),
+    transfer_id    uuid          NOT NULL REFERENCES ledger.transfers(id),
     debits_posted  numeric(39,0) NOT NULL CHECK (debits_posted >= 0),
     credits_posted numeric(39,0) NOT NULL CHECK (credits_posted >= 0),
-    applied_at     timestamptz   NOT NULL,
+    closed         boolean       NOT NULL,
 
-    PRIMARY KEY (transfer_id, account_id),
-    UNIQUE (account_id, applied_at)
+    PRIMARY KEY (account_id, version),
+    UNIQUE (transfer_id, account_id)
 );
+
+-- Only post_transfer() may insert: this trigger is depth 1, its insert depth 2.
+CREATE OR REPLACE FUNCTION ledger.raise_direct_insert()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF pg_trigger_depth() < 2 THEN
+        RAISE EXCEPTION 'ledger.% is written by posting transfers; INSERT into it directly is not allowed', TG_TABLE_NAME
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER account_balances_no_direct_insert
+    BEFORE INSERT ON ledger.account_balances
+    FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_direct_insert();
 
 CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON ledger.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
 
 
--- Posts every transfer an INSERT created: appends two balance rows per transfer
--- and enforces the overdraft flags. A transfer that would break one raises LG001,
--- a dedicated errcode so callers can tell it apart from other constraint failures.
+-- Posts the inserted transfers. LG001: overdraft flag broken. LG002: account
+-- closed. LG003: closing would leave a nonzero balance.
 CREATE OR REPLACE FUNCTION ledger.post_transfer()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -116,13 +178,10 @@ DECLARE
     debit_credits  numeric(39,0);
     credit_debits  numeric(39,0);
     credit_credits numeric(39,0);
-    applied        timestamptz;
 BEGIN
-    -- Locks every account the statement touches in one pass, sorted by id, so
-    -- concurrent statements lock in the same order and can only wait on each other,
-    -- never deadlock. Sorted within one statement only: post a batch as one INSERT.
-    -- FOR NO KEY UPDATE, not FOR UPDATE: the FK checks already hold FOR KEY SHARE
-    -- on these rows, and FOR UPDATE would conflict with it.
+    -- Lock all touched accounts in id order so concurrent posts can't deadlock.
+    -- The order holds within one statement only: post a batch as one INSERT.
+    -- NO KEY UPDATE because the FK checks already hold KEY SHARE on these rows.
     SELECT array_agg(DISTINCT a ORDER BY a) INTO ids
     FROM new_transfers, LATERAL (VALUES (debit_account_id), (credit_account_id)) v(a);
 
@@ -135,22 +194,31 @@ BEGIN
     ORDER BY id
     FOR NO KEY UPDATE;
 
-    -- Transition tables have no row order, and order changes outcomes (a grant then
-    -- a deduction can succeed where the reverse fails), so post in id order. UUIDv7
-    -- ids generated in sequence make that the order the caller created them.
+    -- Transition tables are unordered and order changes outcomes (a grant then a
+    -- deduction can succeed where the reverse fails), so post in id order, which
+    -- for UUIDv7 ids is creation order.
     FOR t IN SELECT * FROM new_transfers ORDER BY id LOOP
         SELECT * INTO debit_account  FROM ledger.accounts WHERE id = t.debit_account_id;
         SELECT * INTO credit_account FROM ledger.accounts WHERE id = t.credit_account_id;
 
         SELECT * INTO debit_prev FROM ledger.account_balances
         WHERE account_id = t.debit_account_id
-        ORDER BY applied_at DESC
+        ORDER BY version DESC
         LIMIT 1;
 
         SELECT * INTO credit_prev FROM ledger.account_balances
         WHERE account_id = t.credit_account_id
-        ORDER BY applied_at DESC
+        ORDER BY version DESC
         LIMIT 1;
+
+        IF debit_prev.closed THEN
+            RAISE EXCEPTION 'account % is closed', t.debit_account_id
+                USING ERRCODE = 'LG002';
+        END IF;
+        IF credit_prev.closed THEN
+            RAISE EXCEPTION 'account % is closed', t.credit_account_id
+                USING ERRCODE = 'LG002';
+        END IF;
 
         debit_debits   := COALESCE(debit_prev.debits_posted, 0) + t.amount;
         debit_credits  := COALESCE(debit_prev.credits_posted, 0);
@@ -181,13 +249,22 @@ BEGIN
                 USING ERRCODE = 'LG001';
         END IF;
 
-        applied := clock_timestamp();
+        IF t.close_debit_account AND debit_debits <> debit_credits THEN
+            RAISE EXCEPTION 'account % cannot close: debits % and credits % would not balance',
+                t.debit_account_id, debit_debits, debit_credits
+                USING ERRCODE = 'LG003';
+        END IF;
+        IF t.close_credit_account AND credit_debits <> credit_credits THEN
+            RAISE EXCEPTION 'account % cannot close: debits % and credits % would not balance',
+                t.credit_account_id, credit_debits, credit_credits
+                USING ERRCODE = 'LG003';
+        END IF;
 
         INSERT INTO ledger.account_balances
-            (transfer_id, account_id, debits_posted, credits_posted, applied_at)
+            (account_id, version, transfer_id, debits_posted, credits_posted, closed)
         VALUES
-            (t.id, t.debit_account_id,  debit_debits,  debit_credits,  applied),
-            (t.id, t.credit_account_id, credit_debits, credit_credits, applied);
+            (t.debit_account_id,  COALESCE(debit_prev.version, 0) + 1,  t.id, debit_debits,  debit_credits,  t.close_debit_account),
+            (t.credit_account_id, COALESCE(credit_prev.version, 0) + 1, t.id, credit_debits, credit_credits, t.close_credit_account);
     END LOOP;
 
     RETURN NULL;
@@ -200,23 +277,22 @@ CREATE TRIGGER transfers_post
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.post_transfer();
 
 
--- Every account's latest balance, with zeros if never posted to. balance is
--- debits minus credits: users read positive, the issuer negative, so a ledger
--- sums to zero.
+-- Every account's latest totals, zeros if never posted to. balance is debits minus
+-- credits, so a ledger sums to zero. Upgrades can only append columns.
 CREATE VIEW ledger.current_balances AS
 SELECT
     a.id        AS account_id,
     a.ledger_id,
-    a.external_user_id,
+    COALESCE(b.version,        0) AS version,
     COALESCE(b.debits_posted,  0) AS debits_posted,
     COALESCE(b.credits_posted, 0) AS credits_posted,
     COALESCE(b.debits_posted,  0) - COALESCE(b.credits_posted, 0) AS balance,
-    b.applied_at
+    COALESCE(b.closed,     false) AS closed
 FROM ledger.accounts a
 LEFT JOIN LATERAL (
-    SELECT ab.debits_posted, ab.credits_posted, ab.applied_at
+    SELECT ab.version, ab.debits_posted, ab.credits_posted, ab.closed
     FROM ledger.account_balances ab
     WHERE ab.account_id = a.id
-    ORDER BY ab.applied_at DESC
+    ORDER BY ab.version DESC
     LIMIT 1
 ) b ON true;
