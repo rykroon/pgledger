@@ -53,7 +53,7 @@ CREATE TABLE ledger.accounts (
     id                 uuid        PRIMARY KEY,
     created_at         timestamptz NOT NULL,
     ledger_id          uuid        NOT NULL REFERENCES ledger.ledgers(id),
-    code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
+    code               integer     NOT NULL CHECK (code > 0),
     external_id        uuid,
     external_timestamp timestamptz,
 
@@ -81,27 +81,19 @@ CREATE TRIGGER accounts_immutable
 -- Value flows credit -> debit. The composite FKs make a cross-ledger transfer
 -- unwritable. external_timestamp is the caller's own time and changes no ordering.
 --
--- The close_* flags permanently close that account, which must be left at zero;
--- only a closing transfer may have a zero amount.
---
 -- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.transfers (
-    id                   uuid          PRIMARY KEY,
-    created_at           timestamptz   NOT NULL,
-    ledger_id            uuid          NOT NULL,
-    debit_account_id     uuid          NOT NULL,
-    credit_account_id    uuid          NOT NULL,
-    amount               numeric(39,0) NOT NULL CHECK (amount >= 0),
-    code                 integer       NOT NULL CHECK (code BETWEEN 1 AND 65535),
-    external_id          uuid,
-    external_timestamp   timestamptz,
-    close_debit_account  boolean       NOT NULL DEFAULT false,
-    close_credit_account boolean       NOT NULL DEFAULT false,
+    id                 uuid          PRIMARY KEY,
+    created_at         timestamptz   NOT NULL,
+    ledger_id          uuid          NOT NULL,
+    debit_account_id   uuid          NOT NULL,
+    credit_account_id  uuid          NOT NULL,
+    amount             numeric(39,0) NOT NULL CHECK (amount > 0),
+    code               integer       NOT NULL CHECK (code > 0),
+    external_id        uuid,
+    external_timestamp timestamptz,
 
     CHECK (debit_account_id <> credit_account_id),
-
-    CONSTRAINT transfers_zero_amount_closes
-        CHECK (amount > 0 OR close_debit_account OR close_credit_account),
 
     FOREIGN KEY (debit_account_id, ledger_id)  REFERENCES ledger.accounts (id, ledger_id),
     FOREIGN KEY (credit_account_id, ledger_id) REFERENCES ledger.accounts (id, ledger_id)
@@ -129,14 +121,12 @@ CREATE TRIGGER transfers_immutable
 -- existing version and fails on the primary key instead of forking the chain.
 --
 -- Balance isn't stored: it's the totals' difference, sign left to the reader.
--- closed is only ever true on an account's last row.
 CREATE TABLE ledger.account_balances (
     account_id     uuid          NOT NULL REFERENCES ledger.accounts(id),
     version        bigint        NOT NULL CHECK (version > 0),
     transfer_id    uuid          NOT NULL REFERENCES ledger.transfers(id),
     debits_posted  numeric(39,0) NOT NULL CHECK (debits_posted >= 0),
     credits_posted numeric(39,0) NOT NULL CHECK (credits_posted >= 0),
-    closed         boolean       NOT NULL,
 
     PRIMARY KEY (account_id, version),
     UNIQUE (transfer_id, account_id)
@@ -163,8 +153,8 @@ CREATE TRIGGER account_balances_immutable
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
 
 
--- Posts the inserted transfers. LG001: overdraft flag broken. LG002: account
--- closed. LG003: closing would leave a nonzero balance.
+-- Posts the inserted transfers. A broken overdraft flag raises LG001, so callers
+-- can tell it apart from other constraint failures.
 CREATE OR REPLACE FUNCTION ledger.post_transfer()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -211,15 +201,6 @@ BEGIN
         ORDER BY version DESC
         LIMIT 1;
 
-        IF debit_prev.closed THEN
-            RAISE EXCEPTION 'account % is closed', t.debit_account_id
-                USING ERRCODE = 'LG002';
-        END IF;
-        IF credit_prev.closed THEN
-            RAISE EXCEPTION 'account % is closed', t.credit_account_id
-                USING ERRCODE = 'LG002';
-        END IF;
-
         debit_debits   := COALESCE(debit_prev.debits_posted, 0) + t.amount;
         debit_credits  := COALESCE(debit_prev.credits_posted, 0);
         credit_debits  := COALESCE(credit_prev.debits_posted, 0);
@@ -249,22 +230,11 @@ BEGIN
                 USING ERRCODE = 'LG001';
         END IF;
 
-        IF t.close_debit_account AND debit_debits <> debit_credits THEN
-            RAISE EXCEPTION 'account % cannot close: debits % and credits % would not balance',
-                t.debit_account_id, debit_debits, debit_credits
-                USING ERRCODE = 'LG003';
-        END IF;
-        IF t.close_credit_account AND credit_debits <> credit_credits THEN
-            RAISE EXCEPTION 'account % cannot close: debits % and credits % would not balance',
-                t.credit_account_id, credit_debits, credit_credits
-                USING ERRCODE = 'LG003';
-        END IF;
-
         INSERT INTO ledger.account_balances
-            (account_id, version, transfer_id, debits_posted, credits_posted, closed)
+            (account_id, version, transfer_id, debits_posted, credits_posted)
         VALUES
-            (t.debit_account_id,  COALESCE(debit_prev.version, 0) + 1,  t.id, debit_debits,  debit_credits,  t.close_debit_account),
-            (t.credit_account_id, COALESCE(credit_prev.version, 0) + 1, t.id, credit_debits, credit_credits, t.close_credit_account);
+            (t.debit_account_id,  COALESCE(debit_prev.version, 0) + 1,  t.id, debit_debits,  debit_credits),
+            (t.credit_account_id, COALESCE(credit_prev.version, 0) + 1, t.id, credit_debits, credit_credits);
     END LOOP;
 
     RETURN NULL;
@@ -286,11 +256,10 @@ SELECT
     COALESCE(b.version,        0) AS version,
     COALESCE(b.debits_posted,  0) AS debits_posted,
     COALESCE(b.credits_posted, 0) AS credits_posted,
-    COALESCE(b.debits_posted,  0) - COALESCE(b.credits_posted, 0) AS balance,
-    COALESCE(b.closed,     false) AS closed
+    COALESCE(b.debits_posted,  0) - COALESCE(b.credits_posted, 0) AS balance
 FROM ledger.accounts a
 LEFT JOIN LATERAL (
-    SELECT ab.version, ab.debits_posted, ab.credits_posted, ab.closed
+    SELECT ab.version, ab.debits_posted, ab.credits_posted
     FROM ledger.account_balances ab
     WHERE ab.account_id = a.id
     ORDER BY ab.version DESC
