@@ -83,6 +83,37 @@ ORDER BY ab.version;
 
 A transfer that would break a rule is rejected with SQLSTATE `LG001`.
 
+## Balancing transfers
+
+A transfer can move *up to* `amount` instead of exactly `amount`, stopping once an account
+is balanced:
+
+- `balance_debit_account`: move no more than keeps the debit account's debits from
+  exceeding its credits.
+- `balance_credit_account`: move no more than keeps the credit account's credits from
+  exceeding its debits.
+- Both: the smaller of the two limits.
+
+This lets you drain an account without reading its balance first. For example, to pay out
+whatever a customer's credit-normal wallet holds:
+
+```sql
+INSERT INTO ledger.transfers
+    (id, ledger_id, debit_account_id, credit_account_id, amount, code, balance_debit_account)
+VALUES
+    ('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...', 1000000, 3, true);
+```
+
+If the account is already balanced, the transfer still posts but moves nothing. `amount` is
+kept as you sent it; read what was actually moved from `ledger.posted_transfers`:
+
+```sql
+SELECT amount, posted_amount FROM ledger.posted_transfers WHERE id = '...transfer-id...';
+```
+
+For a transfer without either flag, `posted_amount` equals `amount`. Balance rules are still
+enforced against the clamped amount.
+
 ## Your data on accounts and transfers
 
 Accounts and transfers both carry three fields that belong to you. The ledger stores
@@ -101,7 +132,8 @@ them but never interprets them:
 
 - Accounts must belong to an existing ledger.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
-- `amount` must be positive.
+- `amount` must be positive. For a balancing transfer it is the maximum, and the amount
+  actually posted may be zero.
 - `code` must be positive.
 - Supplying `created_at` raises SQLSTATE `428C9` (`generated_always`).
 - An account can require a debit balance or a credit balance, but not both.

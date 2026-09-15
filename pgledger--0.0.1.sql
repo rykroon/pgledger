@@ -81,6 +81,12 @@ CREATE TRIGGER accounts_immutable
 -- Value flows credit -> debit. The composite FKs make a cross-ledger transfer
 -- unwritable. external_timestamp is the caller's own time and changes no ordering.
 --
+-- The balancing flags make amount a maximum, clamped by post_transfer():
+-- balance_debit_account moves no more than keeps the debit account's debits from
+-- exceeding its credits, balance_credit_account no more than keeps the credit
+-- account's credits from exceeding its debits. Both at once take the smaller. The
+-- clamp can reach zero; ledger.posted_transfers has the amount actually moved.
+--
 -- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.transfers (
     id                 uuid          PRIMARY KEY,
@@ -92,6 +98,9 @@ CREATE TABLE ledger.transfers (
     code               integer       NOT NULL CHECK (code > 0),
     external_id        uuid,
     external_timestamp timestamptz,
+
+    balance_debit_account  boolean NOT NULL DEFAULT false,
+    balance_credit_account boolean NOT NULL DEFAULT false,
 
     CHECK (debit_account_id <> credit_account_id),
 
@@ -168,6 +177,7 @@ DECLARE
     debit_credits  numeric(39,0);
     credit_debits  numeric(39,0);
     credit_credits numeric(39,0);
+    posted         numeric(39,0);
 BEGIN
     -- Lock all touched accounts in id order so concurrent posts can't deadlock.
     -- The order holds within one statement only: post a batch as one INSERT.
@@ -201,10 +211,21 @@ BEGIN
         ORDER BY version DESC
         LIMIT 1;
 
-        debit_debits   := COALESCE(debit_prev.debits_posted, 0) + t.amount;
+        -- Balancing clamps amount toward zero balance; zero is posted, not rejected.
+        posted := t.amount;
+        IF t.balance_debit_account THEN
+            posted := LEAST(posted, GREATEST(0,
+                COALESCE(debit_prev.credits_posted, 0) - COALESCE(debit_prev.debits_posted, 0)));
+        END IF;
+        IF t.balance_credit_account THEN
+            posted := LEAST(posted, GREATEST(0,
+                COALESCE(credit_prev.debits_posted, 0) - COALESCE(credit_prev.credits_posted, 0)));
+        END IF;
+
+        debit_debits   := COALESCE(debit_prev.debits_posted, 0) + posted;
         debit_credits  := COALESCE(debit_prev.credits_posted, 0);
         credit_debits  := COALESCE(credit_prev.debits_posted, 0);
-        credit_credits := COALESCE(credit_prev.credits_posted, 0) + t.amount;
+        credit_credits := COALESCE(credit_prev.credits_posted, 0) + posted;
 
         -- Debit side gained debits: a credit-normal account cannot go past zero.
         IF debit_account.require_credit_balance AND debit_debits > debit_credits THEN
