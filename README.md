@@ -105,14 +105,9 @@ VALUES
 ```
 
 If the account is already balanced, the transfer still posts but moves nothing. `amount` is
-kept as you sent it; read what was actually moved from `ledger.posted_transfers`:
-
-```sql
-SELECT amount, posted_amount FROM ledger.posted_transfers WHERE id = '...transfer-id...';
-```
-
-For a transfer without either flag, `posted_amount` equals `amount`. Balance rules are still
-enforced against the clamped amount.
+kept as you sent it. The amount actually moved is the change in `debits_posted` on the debit
+account's `ledger.account_balances` row for the transfer, compared with its previous
+`version`. Balance rules are still enforced against the clamped amount.
 
 ## Your data on accounts and transfers
 

@@ -85,7 +85,7 @@ CREATE TRIGGER accounts_immutable
 -- balance_debit_account moves no more than keeps the debit account's debits from
 -- exceeding its credits, balance_credit_account no more than keeps the credit
 -- account's credits from exceeding its debits. Both at once take the smaller. The
--- clamp can reach zero; ledger.posted_transfers has the amount actually moved.
+-- clamp can reach zero; the amount actually moved is the change in account_balances.
 --
 -- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.transfers (
