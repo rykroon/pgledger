@@ -44,9 +44,9 @@ CREATE TRIGGER ledgers_immutable
 -- A balance on one ledger. code, external_id and external_timestamp are opaque
 -- caller data; nothing is unique beyond id.
 --
--- The flags are overdraft rules enforced by post_transfer(): require_debit_balance
--- keeps a user from being overdrawn, require_credit_balance keeps an issuer from
--- redeeming past what it issued. Both at once would pin the balance to zero.
+-- The flags are balance rules enforced by post_transfer(): require_debit_balance
+-- keeps credits from exceeding debits, require_credit_balance keeps debits from
+-- exceeding credits. Both at once would pin the balance to zero.
 --
 -- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.accounts (
@@ -153,7 +153,7 @@ CREATE TRIGGER account_balances_immutable
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
 
 
--- Posts the inserted transfers. A broken overdraft flag raises LG001, so callers
+-- Posts the inserted transfers. A broken balance rule raises LG001, so callers
 -- can tell it apart from other constraint failures.
 CREATE OR REPLACE FUNCTION ledger.post_transfer()
 RETURNS TRIGGER AS $$
@@ -184,8 +184,8 @@ BEGIN
     ORDER BY id
     FOR NO KEY UPDATE;
 
-    -- Transition tables are unordered and order changes outcomes (a grant then a
-    -- deduction can succeed where the reverse fails), so post in id order, which
+    -- Transition tables are unordered and order changes outcomes (a deposit then a
+    -- withdrawal can succeed where the reverse fails), so post in id order, which
     -- for UUIDv7 ids is creation order.
     FOR t IN SELECT * FROM new_transfers ORDER BY id LOOP
         SELECT * INTO debit_account  FROM ledger.accounts WHERE id = t.debit_account_id;
@@ -206,7 +206,7 @@ BEGIN
         credit_debits  := COALESCE(credit_prev.debits_posted, 0);
         credit_credits := COALESCE(credit_prev.credits_posted, 0) + t.amount;
 
-        -- Debit side gained debits: an issuer cannot redeem past what it issued.
+        -- Debit side gained debits: a credit-normal account cannot go past zero.
         IF debit_account.require_credit_balance AND debit_debits > debit_credits THEN
             RAISE EXCEPTION 'account % is credit-normal: debits % would exceed credits %',
                 debit_account.id, debit_debits, debit_credits
@@ -218,7 +218,7 @@ BEGIN
                 USING ERRCODE = 'LG001';
         END IF;
 
-        -- Credit side gained credits: a user cannot be overdrawn.
+        -- Credit side gained credits: a debit-normal account cannot go past zero.
         IF credit_account.require_debit_balance AND credit_credits > credit_debits THEN
             RAISE EXCEPTION 'account % is debit-normal: credits % would exceed debits %',
                 credit_account.id, credit_credits, credit_debits
