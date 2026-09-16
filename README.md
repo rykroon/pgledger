@@ -41,28 +41,21 @@ INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
 VALUES ('...revenue-id...', '...ledger-id...', 2, true);
 ```
 
-Post a transfer with `ledger.create_transfers()`. Value flows credit -> debit, so recording
-a sale debits cash and credits revenue:
+Post a transfer. Value flows credit -> debit, so recording a sale debits cash and credits
+revenue:
 
 ```sql
-SELECT * FROM ledger.create_transfers(
-    ROW('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id...',
-        100, 1, NULL, NULL, NULL, NULL)::ledger.transfer_input
-);
+INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount, code)
+VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id...', 100, 1);
 ```
 
-Each argument is a `ledger.transfer_input`: `id`, `ledger_id`, `debit_account_id`,
-`credit_account_id`, `amount`, `code`, `external_id`, `external_timestamp`,
-`balance_debit_account`, `balance_credit_account`. `NULL` flags mean `false`. Pass several
-rows, or `VARIADIC` an array of them, to post a batch; they are applied in argument order,
-each with its own `created_at`, and the call returns the stored rows. A failure anywhere in
-the batch rolls back the whole call.
+A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
+and enforces the balance rules. Post a batch as a single multi-row `INSERT`: the rows are
+applied in the order you wrote them, each posted in full before the next, and a failure
+anywhere rolls back the whole statement. A batch may span ledgers.
 
-`create_transfers()` appends the new running totals to `ledger.account_balances` and
-enforces the balance rules. It is the only way to write transfers: a direct `INSERT` into
-`ledger.transfers` is rejected. Calls are serialized by an advisory lock held until the
-calling transaction ends, so one transaction writes transfers at a time and `created_at`
-orders transfers across the whole ledger.
+A retry is safe with `ON CONFLICT (id) DO NOTHING`: rows that already exist are skipped
+and never posted twice.
 
 Read balances:
 
@@ -109,16 +102,22 @@ This lets you drain an account without reading its balance first. For example, t
 whatever a customer's credit-normal wallet holds:
 
 ```sql
-SELECT amount_posted FROM ledger.create_transfers(
-    ROW('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...',
-        1000000, 3, NULL, NULL, true, NULL)::ledger.transfer_input
-);
+INSERT INTO ledger.transfers
+    (id, ledger_id, debit_account_id, credit_account_id, amount, code, balance_debit_account)
+VALUES
+    ('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...', 1000000, 3, true);
 ```
 
 If the account is already balanced, the transfer still posts but moves nothing. `amount` is
-kept as you sent it; the amount actually moved is stored in `amount_posted`, which equals
-`amount` for a non-balancing transfer. Balance rules are still enforced against the clamped
-amount.
+kept as you sent it; the amount actually moved is `amount_posted` on the transfer's
+`ledger.account_balances` rows, which equals `amount` for a non-balancing transfer:
+
+```sql
+SELECT amount_posted FROM ledger.account_balances
+WHERE transfer_id = '...transfer-id...' AND account_id = '...wallet-id...';
+```
+
+Balance rules are still enforced against the clamped amount.
 
 ## Your data on accounts and transfers
 
@@ -132,9 +131,27 @@ them but never interprets them:
   customer, an order, or a group of related transfers.
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
   date or the original time of an imported record. It doesn't change the order balances
-  are applied in. `created_at` is always set by the ledger: for ledgers and accounts it is
-  the time of the inserting transaction, for transfers the moment `create_transfers()`
-  created that row.
+  are applied in. `created_at` is always set by the ledger to the time of the inserting
+  transaction, never by you. Transfers posted in one transaction share it.
+
+Transfers also carry `seq`, assigned by the ledger as each row is inserted. It is what
+orders a multi-row `INSERT`, and a tiebreak for listings that share `created_at`. It is
+allocation order, not commit order: a lower `seq` can commit later, so don't use it as a
+change cursor. Within one account, `ledger.account_balances.version` is the order of record.
+
+## Concurrency
+
+Posting locks every account the statement touches, in `id` order, until the transaction
+ends. Two transactions never post to the same account at once, which is what keeps `version`
+gapless and the balance rules honest. Transfers on disjoint accounts post in parallel, and
+creating accounts is never blocked.
+
+Because the locks are taken in `id` order, two concurrent statements that touch the same
+accounts cannot deadlock, however their rows are ordered. That holds within a single
+statement. A transaction that posts in several statements accumulates locks in statement
+order, so two transactions reaching the same accounts through separate statements, in
+opposite order, can deadlock and one will be rolled back with SQLSTATE `40P01`. Post
+everything a transaction needs in one `INSERT` to avoid it.
 
 ## Constraints
 
@@ -143,11 +160,8 @@ them but never interprets them:
 - `amount` must be positive. For a balancing transfer it is the maximum, and the amount
   actually posted may be zero.
 - `code` must be positive.
-- Supplying `created_at` on a ledger or account raises SQLSTATE `428C9` (`generated_always`).
+- Supplying `created_at` raises SQLSTATE `428C9` (`generated_always`).
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule raises SQLSTATE `LG001`.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables raises
-  `restrict_violation`, and so does inserting into `ledger.transfers` or
-  `ledger.account_balances` directly. That check is a transaction-local setting that
-  `create_transfers()` turns on, not a privilege boundary: to enforce it against callers,
-  revoke `INSERT` on those tables and grant `EXECUTE` on the function.
+  `restrict_violation`, and so does inserting into `ledger.account_balances` directly.
