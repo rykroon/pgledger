@@ -41,17 +41,28 @@ INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
 VALUES ('...revenue-id...', '...ledger-id...', 2, true);
 ```
 
-Post a transfer. Value flows credit -> debit, so recording a sale debits cash and credits
-revenue:
+Post a transfer with `ledger.create_transfers()`. Value flows credit -> debit, so recording
+a sale debits cash and credits revenue:
 
 ```sql
-INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount, code)
-VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id...', 100, 1);
+SELECT * FROM ledger.create_transfers(
+    ROW('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id...',
+        100, 1, NULL, NULL, NULL, NULL)::ledger.transfer_input
+);
 ```
 
-A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
-and enforces the balance rules. Batch transfers by posting them as a single `INSERT` —
-they are applied in `id` order.
+Each argument is a `ledger.transfer_input`: `id`, `ledger_id`, `debit_account_id`,
+`credit_account_id`, `amount`, `code`, `external_id`, `external_timestamp`,
+`balance_debit_account`, `balance_credit_account`. `NULL` flags mean `false`. Pass several
+rows, or `VARIADIC` an array of them, to post a batch; they are applied in argument order,
+each with its own `created_at`, and the call returns the stored rows. A failure anywhere in
+the batch rolls back the whole call.
+
+`create_transfers()` appends the new running totals to `ledger.account_balances` and
+enforces the balance rules. It is the only way to write transfers: a direct `INSERT` into
+`ledger.transfers` is rejected. Calls are serialized by an advisory lock held until the
+calling transaction ends, so one transaction writes transfers at a time and `created_at`
+orders transfers across the whole ledger.
 
 Read balances:
 
@@ -98,16 +109,16 @@ This lets you drain an account without reading its balance first. For example, t
 whatever a customer's credit-normal wallet holds:
 
 ```sql
-INSERT INTO ledger.transfers
-    (id, ledger_id, debit_account_id, credit_account_id, amount, code, balance_debit_account)
-VALUES
-    ('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...', 1000000, 3, true);
+SELECT amount_posted FROM ledger.create_transfers(
+    ROW('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...',
+        1000000, 3, NULL, NULL, true, NULL)::ledger.transfer_input
+);
 ```
 
 If the account is already balanced, the transfer still posts but moves nothing. `amount` is
-kept as you sent it. The amount actually moved is the change in `debits_posted` on the debit
-account's `ledger.account_balances` row for the transfer, compared with its previous
-`version`. Balance rules are still enforced against the clamped amount.
+kept as you sent it; the amount actually moved is stored in `amount_posted`, which equals
+`amount` for a non-balancing transfer. Balance rules are still enforced against the clamped
+amount.
 
 ## Your data on accounts and transfers
 
@@ -121,7 +132,9 @@ them but never interprets them:
   customer, an order, or a group of related transfers.
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
   date or the original time of an imported record. It doesn't change the order balances
-  are applied in. `created_at` is always set by the ledger to the time of the inserting transaction.
+  are applied in. `created_at` is always set by the ledger: for ledgers and accounts it is
+  the time of the inserting transaction, for transfers the moment `create_transfers()`
+  created that row.
 
 ## Constraints
 
@@ -130,8 +143,11 @@ them but never interprets them:
 - `amount` must be positive. For a balancing transfer it is the maximum, and the amount
   actually posted may be zero.
 - `code` must be positive.
-- Supplying `created_at` raises SQLSTATE `428C9` (`generated_always`).
+- Supplying `created_at` on a ledger or account raises SQLSTATE `428C9` (`generated_always`).
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule raises SQLSTATE `LG001`.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables raises
-  `restrict_violation`, and so does inserting into `ledger.account_balances` directly.
+  `restrict_violation`, and so does inserting into `ledger.transfers` or
+  `ledger.account_balances` directly. That check is a transaction-local setting that
+  `create_transfers()` turns on, not a privilege boundary: to enforce it against callers,
+  revoke `INSERT` on those tables and grant `EXECUTE` on the function.

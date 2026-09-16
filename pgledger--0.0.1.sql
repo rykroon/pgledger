@@ -26,6 +26,22 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- Only create_transfers() writes transfers and account_balances. It sets
+-- ledger.creating_transfers for the duration of the call, transaction-locally, so
+-- a plain INSERT never reaches the tables. A guard rail against bypassing the
+-- function's checks, not a privilege boundary: anyone with INSERT can set it too.
+CREATE OR REPLACE FUNCTION ledger.raise_unless_creating_transfers()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF current_setting('ledger.creating_transfers', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'ledger.% is written by ledger.create_transfers(); INSERT into it directly is not allowed', TG_TABLE_NAME
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
 -- A ledger: one unit of value. Deliberately bare; mutable attributes belong in the
 -- caller's own table keyed by ledger_id. Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.ledgers (
@@ -44,7 +60,7 @@ CREATE TRIGGER ledgers_immutable
 -- A balance on one ledger. code, external_id and external_timestamp are opaque
 -- caller data; nothing is unique beyond id.
 --
--- The flags are balance rules enforced by post_transfer(): require_debit_balance
+-- The flags are balance rules enforced by create_transfers(): require_debit_balance
 -- keeps credits from exceeding debits, require_credit_balance keeps debits from
 -- exceeding credits. Both at once would pin the balance to zero.
 --
@@ -81,11 +97,14 @@ CREATE TRIGGER accounts_immutable
 -- Value flows credit -> debit. The composite FKs make a cross-ledger transfer
 -- unwritable. external_timestamp is the caller's own time and changes no ordering.
 --
--- The balancing flags make amount a maximum, clamped by post_transfer():
+-- Written only by create_transfers(), which stamps created_at with clock_timestamp()
+-- per row, so created_at is the order transfers were created in.
+--
+-- The balancing flags make amount a maximum, clamped by create_transfers():
 -- balance_debit_account moves no more than keeps the debit account's debits from
 -- exceeding its credits, balance_credit_account no more than keeps the credit
 -- account's credits from exceeding its debits. Both at once take the smaller. The
--- clamp can reach zero; the amount actually moved is the change in account_balances.
+-- clamp can reach zero; amount_posted is what actually moved.
 --
 -- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.transfers (
@@ -95,6 +114,7 @@ CREATE TABLE ledger.transfers (
     debit_account_id   uuid          NOT NULL,
     credit_account_id  uuid          NOT NULL,
     amount             numeric(39,0) NOT NULL CHECK (amount > 0),
+    amount_posted      numeric(39,0) NOT NULL CHECK (amount_posted >= 0 AND amount_posted <= amount),
     code               integer       NOT NULL CHECK (code > 0),
     external_id        uuid,
     external_timestamp timestamptz,
@@ -115,9 +135,9 @@ CREATE INDEX transfers_ledger_id_created_at_idx ON ledger.transfers (ledger_id, 
 CREATE INDEX transfers_external_id_idx ON ledger.transfers (external_id)
     WHERE external_id IS NOT NULL;
 
-CREATE TRIGGER transfers_set_created_at
+CREATE TRIGGER transfers_no_direct_insert
     BEFORE INSERT ON ledger.transfers
-    FOR EACH ROW EXECUTE FUNCTION ledger.set_created_at();
+    FOR EACH ROW EXECUTE FUNCTION ledger.raise_unless_creating_transfers();
 
 CREATE TRIGGER transfers_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON ledger.transfers
@@ -125,7 +145,7 @@ CREATE TRIGGER transfers_immutable
 
 -- An account's running totals after each transfer, two rows per transfer. Immutable.
 --
--- version is previous + 1, assigned under the account lock, so it is gapless and
+-- version is previous + 1, assigned under the write lock, so it is gapless and
 -- can't go backwards like a clock. A writer on a stale snapshot computes an
 -- existing version and fails on the primary key instead of forking the chain.
 --
@@ -141,33 +161,39 @@ CREATE TABLE ledger.account_balances (
     UNIQUE (transfer_id, account_id)
 );
 
--- Only post_transfer() may insert: this trigger is depth 1, its insert depth 2.
-CREATE OR REPLACE FUNCTION ledger.raise_direct_insert()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF pg_trigger_depth() < 2 THEN
-        RAISE EXCEPTION 'ledger.% is written by posting transfers; INSERT into it directly is not allowed', TG_TABLE_NAME
-            USING ERRCODE = 'restrict_violation';
-    END IF;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
 CREATE TRIGGER account_balances_no_direct_insert
     BEFORE INSERT ON ledger.account_balances
-    FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_direct_insert();
+    FOR EACH ROW EXECUTE FUNCTION ledger.raise_unless_creating_transfers();
 
 CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON ledger.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
 
 
--- Posts the inserted transfers. A broken balance rule raises LG001, so callers
--- can tell it apart from other constraint failures.
-CREATE OR REPLACE FUNCTION ledger.post_transfer()
-RETURNS TRIGGER AS $$
+-- Input to create_transfers(): the caller-supplied columns of ledger.transfers.
+-- NULL balancing flags mean false.
+CREATE TYPE ledger.transfer_input AS (
+    id                     uuid,
+    ledger_id              uuid,
+    debit_account_id       uuid,
+    credit_account_id      uuid,
+    amount                 numeric(39,0),
+    code                   integer,
+    external_id            uuid,
+    external_timestamp     timestamptz,
+    balance_debit_account  boolean,
+    balance_credit_account boolean
+);
+
+
+-- Creates and posts transfers in argument order, returning the rows as stored.
+-- Order changes outcomes (a deposit then a withdrawal can succeed where the reverse
+-- fails). A broken balance rule raises LG001, so callers can tell it apart from
+-- other constraint failures; any failure rolls back the whole call.
+CREATE OR REPLACE FUNCTION ledger.create_transfers(VARIADIC inputs ledger.transfer_input[])
+RETURNS SETOF ledger.transfers AS $$
 DECLARE
-    ids            uuid[];
+    i              ledger.transfer_input;
     t              ledger.transfers%ROWTYPE;
     debit_account  ledger.accounts%ROWTYPE;
     credit_account ledger.accounts%ROWTYPE;
@@ -179,45 +205,36 @@ DECLARE
     credit_credits numeric(39,0);
     posted         numeric(39,0);
 BEGIN
-    -- Lock all touched accounts in id order so concurrent posts can't deadlock.
-    -- The order holds within one statement only: post a batch as one INSERT.
-    -- NO KEY UPDATE because the FK checks already hold KEY SHARE on these rows.
-    SELECT array_agg(DISTINCT a ORDER BY a) INTO ids
-    FROM new_transfers, LATERAL (VALUES (debit_account_id), (credit_account_id)) v(a);
+    -- One writer at a time, held until the transaction ends. Replaces per-account
+    -- row locks: no deadlocks, version never collides, and created_at is the commit
+    -- order across the whole ledger. Under REPEATABLE READ or SERIALIZABLE the
+    -- snapshot can predate the lock; the account_balances primary key catches that.
+    PERFORM pg_advisory_xact_lock(hashtext('ledger.create_transfers'));
 
-    IF ids IS NULL THEN
-        RETURN NULL;
-    END IF;
+    -- Opens the guarded tables for this call only; cleared before returning.
+    PERFORM set_config('ledger.creating_transfers', 'on', true);
 
-    PERFORM id FROM ledger.accounts
-    WHERE id = ANY(ids)
-    ORDER BY id
-    FOR NO KEY UPDATE;
-
-    -- Transition tables are unordered and order changes outcomes (a deposit then a
-    -- withdrawal can succeed where the reverse fails), so post in id order, which
-    -- for UUIDv7 ids is creation order.
-    FOR t IN SELECT * FROM new_transfers ORDER BY id LOOP
-        SELECT * INTO debit_account  FROM ledger.accounts WHERE id = t.debit_account_id;
-        SELECT * INTO credit_account FROM ledger.accounts WHERE id = t.credit_account_id;
+    FOREACH i IN ARRAY inputs LOOP
+        SELECT * INTO debit_account  FROM ledger.accounts WHERE id = i.debit_account_id;
+        SELECT * INTO credit_account FROM ledger.accounts WHERE id = i.credit_account_id;
 
         SELECT * INTO debit_prev FROM ledger.account_balances
-        WHERE account_id = t.debit_account_id
+        WHERE account_id = i.debit_account_id
         ORDER BY version DESC
         LIMIT 1;
 
         SELECT * INTO credit_prev FROM ledger.account_balances
-        WHERE account_id = t.credit_account_id
+        WHERE account_id = i.credit_account_id
         ORDER BY version DESC
         LIMIT 1;
 
         -- Balancing clamps amount toward zero balance; zero is posted, not rejected.
-        posted := t.amount;
-        IF t.balance_debit_account THEN
+        posted := i.amount;
+        IF COALESCE(i.balance_debit_account, false) THEN
             posted := LEAST(posted, GREATEST(0,
                 COALESCE(debit_prev.credits_posted, 0) - COALESCE(debit_prev.debits_posted, 0)));
         END IF;
-        IF t.balance_credit_account THEN
+        IF COALESCE(i.balance_credit_account, false) THEN
             posted := LEAST(posted, GREATEST(0,
                 COALESCE(credit_prev.debits_posted, 0) - COALESCE(credit_prev.credits_posted, 0)));
         END IF;
@@ -251,21 +268,29 @@ BEGIN
                 USING ERRCODE = 'LG001';
         END IF;
 
+        INSERT INTO ledger.transfers
+            (id, created_at, ledger_id, debit_account_id, credit_account_id,
+             amount, amount_posted, code, external_id, external_timestamp,
+             balance_debit_account, balance_credit_account)
+        VALUES
+            (i.id, clock_timestamp(), i.ledger_id, i.debit_account_id, i.credit_account_id,
+             i.amount, posted, i.code, i.external_id, i.external_timestamp,
+             COALESCE(i.balance_debit_account, false), COALESCE(i.balance_credit_account, false))
+        RETURNING * INTO t;
+
         INSERT INTO ledger.account_balances
             (account_id, version, transfer_id, debits_posted, credits_posted)
         VALUES
             (t.debit_account_id,  COALESCE(debit_prev.version, 0) + 1,  t.id, debit_debits,  debit_credits),
             (t.credit_account_id, COALESCE(credit_prev.version, 0) + 1, t.id, credit_debits, credit_credits);
+
+        RETURN NEXT t;
     END LOOP;
 
-    RETURN NULL;
+    -- Close the window so a later plain INSERT in this transaction still fails.
+    PERFORM set_config('ledger.creating_transfers', '', true);
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE TRIGGER transfers_post
-    AFTER INSERT ON ledger.transfers
-    REFERENCING NEW TABLE AS new_transfers
-    FOR EACH STATEMENT EXECUTE FUNCTION ledger.post_transfer();
 
 
 -- Every account's latest totals, zeros if never posted to. balance is debits minus
