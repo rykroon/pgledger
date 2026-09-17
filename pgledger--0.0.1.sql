@@ -46,9 +46,9 @@ CREATE TRIGGER ledgers_immutable
 -- A balance on one ledger. code, external_id and external_timestamp are opaque
 -- caller data; nothing is unique beyond id.
 --
--- The flags are balance rules enforced by post_transfers(): require_debit_balance
--- keeps credits from exceeding debits, require_credit_balance keeps debits from
--- exceeding credits. Both at once would pin the balance to zero.
+-- The flags are balance rules enforced as each account_balances row is written:
+-- require_debit_balance keeps credits from exceeding debits, require_credit_balance
+-- keeps debits from exceeding credits. Both at once would pin the balance to zero.
 --
 -- Immutable; id is a UUID from the caller.
 CREATE TABLE ledger.accounts (
@@ -171,6 +171,41 @@ CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON ledger.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION ledger.raise_immutable();
 
+-- A balance row must satisfy its account's balance rule. Enforced here rather than in
+-- post_transfers() so the rule holds whatever writes the row. Each rule is stated once:
+-- the trigger doesn't know which side of the transfer the row is, and doesn't need to,
+-- because the rule is a predicate on the row's own totals. accounts is immutable, so a
+-- row that passes stays passing.
+CREATE OR REPLACE FUNCTION ledger.check_balance_rule()
+RETURNS TRIGGER AS $$
+DECLARE
+    require_credit boolean;
+    require_debit  boolean;
+BEGIN
+    SELECT require_credit_balance, require_debit_balance
+    INTO require_credit, require_debit
+    FROM ledger.accounts WHERE id = NEW.account_id;
+
+    IF require_credit AND NEW.debits_posted > NEW.credits_posted THEN
+        RAISE EXCEPTION 'account % is credit-normal: transfer % would put debits % past credits %',
+            NEW.account_id, NEW.transfer_id, NEW.debits_posted, NEW.credits_posted
+            USING ERRCODE = 'LG001';
+    END IF;
+
+    IF require_debit AND NEW.credits_posted > NEW.debits_posted THEN
+        RAISE EXCEPTION 'account % is debit-normal: transfer % would put credits % past debits %',
+            NEW.account_id, NEW.transfer_id, NEW.credits_posted, NEW.debits_posted
+            USING ERRCODE = 'LG001';
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER account_balances_check_balance_rule
+    BEFORE INSERT ON ledger.account_balances
+    FOR EACH ROW EXECUTE FUNCTION ledger.check_balance_rule();
+
 
 -- Posts the transfers a statement inserted, in seq order, so a multi-row INSERT is
 -- applied in the order it was written. Order changes outcomes (a deposit then a
@@ -182,8 +217,6 @@ RETURNS TRIGGER AS $$
 DECLARE
     ids            uuid[];
     t              ledger.transfers%ROWTYPE;
-    debit_account  ledger.accounts%ROWTYPE;
-    credit_account ledger.accounts%ROWTYPE;
     debit_prev     ledger.account_balances%ROWTYPE;
     credit_prev    ledger.account_balances%ROWTYPE;
     debit_debits   numeric(39,0);
@@ -215,9 +248,6 @@ BEGIN
     FOR NO KEY UPDATE;
 
     FOR t IN SELECT * FROM new_transfers ORDER BY seq LOOP
-        SELECT * INTO debit_account  FROM ledger.accounts WHERE id = t.debit_account_id;
-        SELECT * INTO credit_account FROM ledger.accounts WHERE id = t.credit_account_id;
-
         SELECT * INTO debit_prev FROM ledger.account_balances
         WHERE account_id = t.debit_account_id
         ORDER BY version DESC
@@ -232,30 +262,6 @@ BEGIN
         debit_credits  := COALESCE(debit_prev.credits_posted, 0);
         credit_debits  := COALESCE(credit_prev.debits_posted, 0);
         credit_credits := COALESCE(credit_prev.credits_posted, 0) + t.amount;
-
-        -- Debit side gained debits: a credit-normal account cannot go past zero.
-        IF debit_account.require_credit_balance AND debit_debits > debit_credits THEN
-            RAISE EXCEPTION 'account % is credit-normal: debits % would exceed credits %',
-                debit_account.id, debit_debits, debit_credits
-                USING ERRCODE = 'LG001';
-        END IF;
-        IF debit_account.require_debit_balance AND debit_credits > debit_debits THEN
-            RAISE EXCEPTION 'account % is debit-normal: credits % would exceed debits %',
-                debit_account.id, debit_credits, debit_debits
-                USING ERRCODE = 'LG001';
-        END IF;
-
-        -- Credit side gained credits: a debit-normal account cannot go past zero.
-        IF credit_account.require_debit_balance AND credit_credits > credit_debits THEN
-            RAISE EXCEPTION 'account % is debit-normal: credits % would exceed debits %',
-                credit_account.id, credit_credits, credit_debits
-                USING ERRCODE = 'LG001';
-        END IF;
-        IF credit_account.require_credit_balance AND credit_debits > credit_credits THEN
-            RAISE EXCEPTION 'account % is credit-normal: debits % would exceed credits %',
-                credit_account.id, credit_debits, credit_credits
-                USING ERRCODE = 'LG001';
-        END IF;
 
         INSERT INTO ledger.account_balances
             (account_id, version, transfer_id, debits_posted, credits_posted)
