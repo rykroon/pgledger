@@ -87,37 +87,38 @@ ORDER BY ab.version;
 
 A transfer that would break a rule is rejected with SQLSTATE `LG001`.
 
-## Balancing transfers
+## Draining an account
 
-A transfer can move *up to* `amount` instead of exactly `amount`, stopping once an account
-is balanced:
-
-- `balance_debit_account`: move no more than keeps the debit account's debits from
-  exceeding its credits.
-- `balance_credit_account`: move no more than keeps the credit account's credits from
-  exceeding its debits.
-- Both: the smaller of the two limits.
-
-This lets you drain an account without reading its balance first. For example, to pay out
-whatever a customer's credit-normal wallet holds:
+To transfer an account's entire balance, lock the accounts, read the balance, and post
+that amount in one transaction. For example, to pay out whatever a customer's
+credit-normal wallet holds:
 
 ```sql
-INSERT INTO ledger.transfers
-    (id, ledger_id, debit_account_id, credit_account_id, amount, code, balance_debit_account)
-VALUES
-    ('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...', 1000000, 3, true);
+BEGIN;
+
+-- Lock both accounts of the transfer, in id order, as posting does.
+SELECT id FROM ledger.accounts
+WHERE id IN ('...wallet-id...', '...cash-id...')
+ORDER BY id
+FOR NO KEY UPDATE;
+
+SELECT -balance AS amount FROM ledger.current_balances WHERE account_id = '...wallet-id...';
+
+-- If amount > 0:
+INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount, code)
+VALUES ('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...', :amount, 3);
+
+COMMIT;
 ```
 
-If the account is already balanced, the transfer still posts but moves nothing. `amount` is
-kept as you sent it; the amount actually moved is `amount_posted` on the transfer's
-`ledger.account_balances` rows, which equals `amount` for a non-balancing transfer:
+Lock `ledger.accounts` rows, which is what posting waits on. Locking `ledger.account_balances`
+rows doesn't block other postings, and an account that has never been posted to has no
+balance rows to lock. Lock both accounts, not just the one being drained: taking one first
+and the other when the transfer posts can deadlock with a concurrent posting.
 
-```sql
-SELECT amount_posted FROM ledger.account_balances
-WHERE transfer_id = '...transfer-id...' AND account_id = '...wallet-id...';
-```
-
-Balance rules are still enforced against the clamped amount.
+Use `READ COMMITTED`. Under `REPEATABLE READ` or `SERIALIZABLE` the balance you read can be
+older than the lock; the insert then fails with a unique violation and the transaction must
+be retried.
 
 ## Your data on accounts and transfers
 
@@ -137,7 +138,7 @@ them but never interprets them:
 Transfers also carry `seq`, assigned by the ledger as each row is inserted. It is what
 orders a multi-row `INSERT`, and a tiebreak for listings that share `created_at`. It is
 allocation order, not commit order: a lower `seq` can commit later, so don't use it as a
-change cursor. Within one account, `ledger.account_balances.version` is the order of record.
+change cursor. For `INSERT ... SELECT`, add an `ORDER BY` to the `SELECT` to control the order. Within one account, `ledger.account_balances.version` is the order of record.
 
 ## Concurrency
 
@@ -157,8 +158,7 @@ everything a transaction needs in one `INSERT` to avoid it.
 
 - Accounts must belong to an existing ledger.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
-- `amount` must be positive. For a balancing transfer it is the maximum, and the amount
-  actually posted may be zero.
+- `amount` must be positive.
 - `code` must be positive.
 - Supplying `created_at` raises SQLSTATE `428C9` (`generated_always`).
 - An account can require a debit balance or a credit balance, but not both.

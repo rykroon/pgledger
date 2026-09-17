@@ -33,6 +33,8 @@ CREATE TABLE ledger.ledgers (
     created_at timestamptz NOT NULL
 );
 
+CREATE INDEX ledgers_created_at_idx ON ledger.ledgers (created_at);
+
 CREATE TRIGGER ledgers_set_created_at
     BEFORE INSERT ON ledger.ledgers
     FOR EACH ROW EXECUTE FUNCTION ledger.set_created_at();
@@ -48,7 +50,7 @@ CREATE TRIGGER ledgers_immutable
 -- keeps credits from exceeding debits, require_credit_balance keeps debits from
 -- exceeding credits. Both at once would pin the balance to zero.
 --
--- Immutable; id is a UUIDv7 from the caller.
+-- Immutable; id is a UUID from the caller.
 CREATE TABLE ledger.accounts (
     id                 uuid        PRIMARY KEY,
     created_at         timestamptz NOT NULL,
@@ -67,8 +69,14 @@ CREATE TABLE ledger.accounts (
     UNIQUE (id, ledger_id)
 );
 
+-- UNIQUE (id, ledger_id) leads with id, so it can't serve ledger_id lookups.
+CREATE INDEX accounts_created_at_idx ON ledger.accounts (created_at);
+CREATE INDEX accounts_ledger_id_idx ON ledger.accounts (ledger_id);
+CREATE INDEX accounts_code_idx ON ledger.accounts (code);
 CREATE INDEX accounts_external_id_idx ON ledger.accounts (external_id)
     WHERE external_id IS NOT NULL;
+CREATE INDEX accounts_external_timestamp_idx ON ledger.accounts (external_timestamp)
+    WHERE external_timestamp IS NOT NULL;
 
 CREATE TRIGGER accounts_set_created_at
     BEFORE INSERT ON ledger.accounts
@@ -87,12 +95,6 @@ CREATE TRIGGER accounts_immutable
 -- a sort key and tiebreak, not a change cursor. created_at is the inserting
 -- transaction's time, as on the other tables, so a batch shares one value.
 --
--- The balancing flags make amount a maximum, clamped by post_transfers():
--- balance_debit_account moves no more than keeps the debit account's debits from
--- exceeding its credits, balance_credit_account no more than keeps the credit
--- account's credits from exceeding its debits. Both at once take the smaller. The
--- clamp can reach zero; account_balances.amount_posted is what actually moved.
---
 -- Immutable; id is a UUIDv7 from the caller.
 CREATE TABLE ledger.transfers (
     id                 uuid          PRIMARY KEY,
@@ -106,9 +108,6 @@ CREATE TABLE ledger.transfers (
     external_id        uuid,
     external_timestamp timestamptz,
 
-    balance_debit_account  boolean NOT NULL DEFAULT false,
-    balance_credit_account boolean NOT NULL DEFAULT false,
-
     CHECK (debit_account_id <> credit_account_id),
 
     FOREIGN KEY (debit_account_id, ledger_id)  REFERENCES ledger.accounts (id, ledger_id),
@@ -117,10 +116,14 @@ CREATE TABLE ledger.transfers (
 
 CREATE INDEX transfers_debit_account_id_idx ON ledger.transfers (debit_account_id);
 CREATE INDEX transfers_credit_account_id_idx ON ledger.transfers (credit_account_id);
--- Serves chronological listings of one ledger's transfers.
+-- Serves ledger_id lookups and chronological listings of one ledger's transfers.
 CREATE INDEX transfers_ledger_id_created_at_idx ON ledger.transfers (ledger_id, created_at);
+CREATE INDEX transfers_created_at_idx ON ledger.transfers (created_at);
+CREATE INDEX transfers_code_idx ON ledger.transfers (code);
 CREATE INDEX transfers_external_id_idx ON ledger.transfers (external_id)
     WHERE external_id IS NOT NULL;
+CREATE INDEX transfers_external_timestamp_idx ON ledger.transfers (external_timestamp)
+    WHERE external_timestamp IS NOT NULL;
 
 CREATE TRIGGER transfers_set_created_at
     BEFORE INSERT ON ledger.transfers
@@ -136,15 +139,11 @@ CREATE TRIGGER transfers_immutable
 -- can't go backwards like a clock. A writer on a stale snapshot computes an
 -- existing version and fails on the primary key instead of forking the chain.
 --
--- amount_posted is what the transfer moved into this account: its amount, or less
--- when a balancing flag clamped it. The same value is on both of a transfer's rows.
---
 -- Balance isn't stored: it's the totals' difference, sign left to the reader.
 CREATE TABLE ledger.account_balances (
     account_id     uuid          NOT NULL REFERENCES ledger.accounts(id),
     version        bigint        NOT NULL CHECK (version > 0),
     transfer_id    uuid          NOT NULL REFERENCES ledger.transfers(id),
-    amount_posted  numeric(39,0) NOT NULL CHECK (amount_posted >= 0),
     debits_posted  numeric(39,0) NOT NULL CHECK (debits_posted >= 0),
     credits_posted numeric(39,0) NOT NULL CHECK (credits_posted >= 0),
 
@@ -191,7 +190,6 @@ DECLARE
     debit_credits  numeric(39,0);
     credit_debits  numeric(39,0);
     credit_credits numeric(39,0);
-    posted         numeric(39,0);
 BEGIN
     -- Lock every account the statement touches, in id order, so two concurrent
     -- statements sharing accounts take them the same way round and cannot deadlock.
@@ -230,21 +228,10 @@ BEGIN
         ORDER BY version DESC
         LIMIT 1;
 
-        -- Balancing clamps amount toward zero balance; zero is posted, not rejected.
-        posted := t.amount;
-        IF t.balance_debit_account THEN
-            posted := LEAST(posted, GREATEST(0,
-                COALESCE(debit_prev.credits_posted, 0) - COALESCE(debit_prev.debits_posted, 0)));
-        END IF;
-        IF t.balance_credit_account THEN
-            posted := LEAST(posted, GREATEST(0,
-                COALESCE(credit_prev.debits_posted, 0) - COALESCE(credit_prev.credits_posted, 0)));
-        END IF;
-
-        debit_debits   := COALESCE(debit_prev.debits_posted, 0) + posted;
+        debit_debits   := COALESCE(debit_prev.debits_posted, 0) + t.amount;
         debit_credits  := COALESCE(debit_prev.credits_posted, 0);
         credit_debits  := COALESCE(credit_prev.debits_posted, 0);
-        credit_credits := COALESCE(credit_prev.credits_posted, 0) + posted;
+        credit_credits := COALESCE(credit_prev.credits_posted, 0) + t.amount;
 
         -- Debit side gained debits: a credit-normal account cannot go past zero.
         IF debit_account.require_credit_balance AND debit_debits > debit_credits THEN
@@ -271,10 +258,10 @@ BEGIN
         END IF;
 
         INSERT INTO ledger.account_balances
-            (account_id, version, transfer_id, amount_posted, debits_posted, credits_posted)
+            (account_id, version, transfer_id, debits_posted, credits_posted)
         VALUES
-            (t.debit_account_id,  COALESCE(debit_prev.version, 0) + 1,  t.id, posted, debit_debits,  debit_credits),
-            (t.credit_account_id, COALESCE(credit_prev.version, 0) + 1, t.id, posted, credit_debits, credit_credits);
+            (t.debit_account_id,  COALESCE(debit_prev.version, 0) + 1,  t.id, debit_debits,  debit_credits),
+            (t.credit_account_id, COALESCE(credit_prev.version, 0) + 1, t.id, credit_debits, credit_credits);
     END LOOP;
 
     RETURN NULL;
