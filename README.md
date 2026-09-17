@@ -50,8 +50,12 @@ VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id.
 ```
 
 A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
-and enforces the balance rules. Batch transfers by posting them as a single `INSERT` —
-they are applied in `id` order.
+and enforces the balance rules. Post a batch as a single multi-row `INSERT`: the rows are
+applied in the order you wrote them, each posted in full before the next, and a failure
+anywhere rolls back the whole statement. A batch may span ledgers.
+
+A retry is safe with `ON CONFLICT (id) DO NOTHING`: rows that already exist are skipped
+and never posted twice.
 
 Read balances:
 
@@ -105,9 +109,15 @@ VALUES
 ```
 
 If the account is already balanced, the transfer still posts but moves nothing. `amount` is
-kept as you sent it. The amount actually moved is the change in `debits_posted` on the debit
-account's `ledger.account_balances` row for the transfer, compared with its previous
-`version`. Balance rules are still enforced against the clamped amount.
+kept as you sent it; the amount actually moved is `amount_posted` on the transfer's
+`ledger.account_balances` rows, which equals `amount` for a non-balancing transfer:
+
+```sql
+SELECT amount_posted FROM ledger.account_balances
+WHERE transfer_id = '...transfer-id...' AND account_id = '...wallet-id...';
+```
+
+Balance rules are still enforced against the clamped amount.
 
 ## Your data on accounts and transfers
 
@@ -121,7 +131,27 @@ them but never interprets them:
   customer, an order, or a group of related transfers.
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
   date or the original time of an imported record. It doesn't change the order balances
-  are applied in. `created_at` is always set by the ledger to the time of the inserting transaction.
+  are applied in. `created_at` is always set by the ledger to the time of the inserting
+  transaction, never by you. Transfers posted in one transaction share it.
+
+Transfers also carry `seq`, assigned by the ledger as each row is inserted. It is what
+orders a multi-row `INSERT`, and a tiebreak for listings that share `created_at`. It is
+allocation order, not commit order: a lower `seq` can commit later, so don't use it as a
+change cursor. Within one account, `ledger.account_balances.version` is the order of record.
+
+## Concurrency
+
+Posting locks every account the statement touches, in `id` order, until the transaction
+ends. Two transactions never post to the same account at once, which is what keeps `version`
+gapless and the balance rules honest. Transfers on disjoint accounts post in parallel, and
+creating accounts is never blocked.
+
+Because the locks are taken in `id` order, two concurrent statements that touch the same
+accounts cannot deadlock, however their rows are ordered. That holds within a single
+statement. A transaction that posts in several statements accumulates locks in statement
+order, so two transactions reaching the same accounts through separate statements, in
+opposite order, can deadlock and one will be rolled back with SQLSTATE `40P01`. Post
+everything a transaction needs in one `INSERT` to avoid it.
 
 ## Constraints
 
