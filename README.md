@@ -1,18 +1,22 @@
 # pgledger
 
-A double-entry ledger for Postgres, packaged as a Trusted Language Extension (TLE).
-Inspired by [TigerBeetle](https://tigerbeetle.com/).
+A double-entry ledger for Postgres, inspired by [TigerBeetle](https://tigerbeetle.com/).
 
 Every transfer moves value from a credit account to a debit account, and both sides are
 recorded. Nothing is ever updated or deleted — ledgers, accounts, transfers, and balances are all append-only, so the full history stays readable.
 
 ## Install
 
+pgledger installs into a schema of your choosing. The schema must already exist:
+
 ```sql
-CREATE EXTENSION pgledger;
+CREATE SCHEMA ledger;
+CREATE EXTENSION pgledger SCHEMA ledger;
 ```
 
-This creates a `ledger` schema holding the extension's objects.
+Any name works — `CREATE EXTENSION pgledger SCHEMA accounting;` puts every object in
+`accounting` instead. Omitting the `SCHEMA` clause installs into the current default
+creation schema, usually `public`. The examples below assume you chose `ledger`.
 
 ## Usage
 
@@ -85,7 +89,7 @@ ORDER BY ab.version;
 - `require_credit_balance`: the account's debits may never exceed its credits.
 - Neither: the balance may be on either side.
 
-A transfer that would break a rule is rejected with SQLSTATE `LG001`.
+A transfer that would break a rule is rejected and the whole statement rolls back.
 
 ## Draining an account
 
@@ -160,8 +164,8 @@ everything a transaction needs in one `INSERT` to avoid it.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
 - `amount` must be positive.
 - `code` must be positive.
-- Supplying `created_at` raises SQLSTATE `428C9` (`generated_always`).
+- `created_at` is assigned by the ledger; supplying it is rejected.
 - An account can require a debit balance or a credit balance, but not both.
-- A transfer that would break a balance rule raises SQLSTATE `LG001`.
-- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables raises
-  `restrict_violation`, and so does inserting into `ledger.account_balances` directly.
+- A transfer that would break a balance rule is rejected.
+- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected, and so is
+  inserting into `ledger.account_balances` directly.
