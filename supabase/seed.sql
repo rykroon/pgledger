@@ -4,12 +4,12 @@
 INSERT INTO ledger.ledgers (id)
 VALUES ('11111111-1111-1111-1111-111111111111');
 
--- cash: debit-normal, credits may never exceed debits.
-INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance)
+-- cash: debit-normal, credits may never exceed debits. Keeps a balance history.
+INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance, history)
 VALUES ('22222222-2222-2222-2222-222222222222',
-        '11111111-1111-1111-1111-111111111111', 1, true);
+        '11111111-1111-1111-1111-111111111111', 1, true, true);
 
--- revenue: credit-normal, debits may never exceed credits.
+-- revenue: credit-normal, debits may never exceed credits. Current totals only (the default).
 INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
 VALUES ('33333333-3333-3333-3333-333333333333',
         '11111111-1111-1111-1111-111111111111', 2, true);

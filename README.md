@@ -3,7 +3,8 @@
 A double-entry ledger for Postgres, inspired by [TigerBeetle](https://tigerbeetle.com/).
 
 Every transfer moves value from a credit account to a debit account, and both sides are
-recorded. Nothing is ever updated or deleted — ledgers, accounts, transfers, and balances are all append-only, so the full history stays readable.
+recorded. Ledgers, accounts, and transfers are append-only. An account keeps either its full
+balance history, also append-only, or only its current totals; you choose per account.
 
 ## Install
 
@@ -36,9 +37,9 @@ table keyed by `ledger_id uuid PRIMARY KEY REFERENCES ledger.ledgers(id)`.
 Create accounts. Each account may optionally restrict which side its balance can be on:
 
 ```sql
--- cash (code 1 in this example): debit-normal, cannot go below zero
-INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance)
-VALUES ('...cash-id...', '...ledger-id...', 1, true);
+-- cash (code 1 in this example): debit-normal, cannot go below zero, keeps a balance history
+INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance, history)
+VALUES ('...cash-id...', '...ledger-id...', 1, true, true);
 
 -- revenue (code 2): credit-normal, cannot go below zero
 INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
@@ -75,8 +76,8 @@ SELECT account_id, balance FROM ledger.current_balances WHERE ledger_id = '...le
 accounts read negative. Every transfer adds the same amount to both sides, so a ledger always
 sums to zero.
 
-For history, `ledger.account_balances` has one row per account per transfer, holding the
-running `debits_posted` and `credits_posted` after that transfer. `version` counts each
+For accounts created with `history`, `ledger.account_balances` has one row per account per
+transfer, holding the running `debits_posted` and `credits_posted` after that transfer. `version` counts each
 account's postings from 1 and is their order; join `ledger.transfers` for timestamps:
 
 ```sql
@@ -86,6 +87,24 @@ JOIN ledger.transfers t ON t.id = ab.transfer_id
 WHERE ab.account_id = '...cash-id...'
 ORDER BY ab.version;
 ```
+
+## History
+
+`history` is chosen when the account is created and, like every other column of an account,
+never changes. It is off by default.
+
+- `history = true`: every posting appends a row to `ledger.account_balances` with the running
+  totals after that transfer. `version` counts the postings from 1 with no gaps, and rows are
+  never updated.
+- `history = false`: only the current totals are kept, in `ledger.account_totals`, one row per
+  account that posting rewrites. `ledger.current_balances` reports `version` 0, and
+  `ledger.account_balances` has no rows for the account.
+
+Both kinds read the same through `ledger.current_balances` and follow the same balance rules,
+checked per transfer. The difference is cost: an account with history adds a row and its index
+entries on every posting; one without rewrites a single row. For single transfers the gap is
+small, for batched postings and for storage it is large. Turn history on for the accounts you
+audit, such as cash or a customer's wallet.
 
 ## Balance rules
 
@@ -185,8 +204,8 @@ transaction already holds and never acquires one out of order. This is the same 
 - `created_at` is assigned by the ledger; supplying it is rejected.
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
-- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected, and so is
-  inserting into `ledger.account_balances` directly.
+- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected, and so is writing
+  `ledger.account_balances` or `ledger.account_totals` directly; posting is their only writer.
 
 ## Benchmark
 

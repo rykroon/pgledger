@@ -171,11 +171,37 @@ func verify(ctx context.Context, conn *pgx.Conn, schema string, rep *report) err
 	}
 	add("transfer rows match posted", n == rep.postedTotal, fmt.Sprintf("%d rows, %d posted", n, rep.postedTotal))
 
+	// Every account's current totals must equal the sums recomputed from transfers, whichever
+	// store holds them.
+	n, err = count(`SELECT count(*) FROM (
+    SELECT cb.debits_posted, cb.credits_posted, COALESCE(d.s, 0) AS d, COALESCE(c.s, 0) AS c
+    FROM ` + q("current_balances") + ` cb
+    LEFT JOIN (SELECT debit_account_id  AS id, sum(amount) AS s FROM ` + q("transfers") + ` GROUP BY 1) d ON d.id = cb.account_id
+    LEFT JOIN (SELECT credit_account_id AS id, sum(amount) AS s FROM ` + q("transfers") + ` GROUP BY 1) c ON c.id = cb.account_id
+) x WHERE debits_posted <> d OR credits_posted <> c`)
+	if err != nil {
+		return err
+	}
+	add("totals match transfers", n == 0, fmt.Sprintf("%d accounts differ from recomputed sums", n))
+
+	// Only legs on accounts with history get balance rows; without the column every leg does.
+	var hasFlag bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = 'history' AND NOT attisdropped)", q("accounts")).Scan(&hasFlag); err != nil {
+		return err
+	}
+	expected := 2 * rep.postedTotal
+	if hasFlag {
+		expected, err = count(`SELECT (SELECT count(*) FROM ` + q("transfers") + ` t JOIN ` + q("accounts") + ` a ON a.id = t.debit_account_id  WHERE a.history)
+		              + (SELECT count(*) FROM ` + q("transfers") + ` t JOIN ` + q("accounts") + ` a ON a.id = t.credit_account_id WHERE a.history)`)
+		if err != nil {
+			return err
+		}
+	}
 	n, err = count("SELECT count(*) FROM " + q("account_balances"))
 	if err != nil {
 		return err
 	}
-	add("two balance rows per transfer", n == 2*rep.postedTotal, fmt.Sprintf("%d rows, %d expected", n, 2*rep.postedTotal))
+	add("balance rows match history legs", n == expected, fmt.Sprintf("%d rows, %d expected", n, expected))
 
 	n, err = count("SELECT count(*) FROM (SELECT account_id FROM " + q("account_balances") + " GROUP BY 1 HAVING max(version) <> count(*)) x")
 	if err != nil {

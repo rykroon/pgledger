@@ -17,6 +17,7 @@ type accountRow struct {
 	ledger       uuid.UUID
 	code         int32
 	requireDebit bool
+	history      bool
 }
 
 // parallel runs fn on n goroutines and returns the first error, cancelling the rest.
@@ -65,19 +66,23 @@ func setupWorld(ctx context.Context, cfg *config, conns []*pgx.Conn, runID uuid.
 		if i < rem {
 			n++
 		}
+		withHistory := int(math.Round(cfg.historyRatio * float64(n-cfg.hotAccounts)))
 		for j := 0; j < n; j++ {
 			id := newID(cfg.uuidVersion)
 			code := int32(codeNormal)
+			hist := true // hot accounts always keep history
 			if j < cfg.hotAccounts {
 				code = codeHot
+			} else {
+				hist = j-cfg.hotAccounts < withHistory
 			}
 			l.all = append(l.all, id)
-			rows = append(rows, accountRow{id: id, ledger: l.id, code: code, requireDebit: cfg.rules})
+			rows = append(rows, accountRow{id: id, ledger: l.id, code: code, requireDebit: cfg.rules, history: hist})
 		}
 		l.hot, l.normal = l.all[:cfg.hotAccounts], l.all[cfg.hotAccounts:]
 		if cfg.rules {
 			l.reserve = newID(cfg.uuidVersion)
-			rows = append(rows, accountRow{id: l.reserve, ledger: l.id, code: codeReserve})
+			rows = append(rows, accountRow{id: l.reserve, ledger: l.id, code: codeReserve, history: true})
 		}
 	}
 
@@ -88,15 +93,23 @@ func setupWorld(ctx context.Context, cfg *config, conns []*pgx.Conn, runID uuid.
 	close(chunks)
 	accountSQL := fmt.Sprintf(`INSERT INTO %s.accounts (id, ledger_id, code, external_id, require_debit_balance)
 SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::bool[])`, pgx.Identifier{cfg.schema}.Sanitize())
+	if cfg.historyRatio >= 0 {
+		accountSQL = fmt.Sprintf(`INSERT INTO %s.accounts (id, ledger_id, code, external_id, require_debit_balance, history)
+SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::bool[], $6::bool[])`, pgx.Identifier{cfg.schema}.Sanitize())
+	}
 	err := parallel(ctx, len(conns), func(ctx context.Context, i int) error {
 		for chunk := range chunks {
 			n := len(chunk)
 			ids, ledgers, ext := make([]uuid.UUID, n), make([]uuid.UUID, n), make([]uuid.UUID, n)
-			codes, rules := make([]int32, n), make([]bool, n)
+			codes, rules, hist := make([]int32, n), make([]bool, n), make([]bool, n)
 			for k, r := range chunk {
-				ids[k], ledgers[k], codes[k], ext[k], rules[k] = r.id, r.ledger, r.code, runID, r.requireDebit
+				ids[k], ledgers[k], codes[k], ext[k], rules[k], hist[k] = r.id, r.ledger, r.code, runID, r.requireDebit, r.history
 			}
-			if _, err := conns[i].Exec(ctx, accountSQL, ids, ledgers, codes, ext, rules); err != nil {
+			args := []any{ids, ledgers, codes, ext, rules}
+			if cfg.historyRatio >= 0 {
+				args = append(args, hist)
+			}
+			if _, err := conns[i].Exec(ctx, accountSQL, args...); err != nil {
 				return fmt.Errorf("create accounts: %w", err)
 			}
 		}

@@ -40,7 +40,9 @@ CREATE TRIGGER ledgers_immutable
 
 -- code, external_id and external_timestamp are opaque caller data; nothing is unique beyond
 -- id. require_debit_balance keeps credits from exceeding debits, require_credit_balance keeps
--- debits from exceeding credits; both at once would pin the balance to zero.
+-- debits from exceeding credits; both at once would pin the balance to zero. history picks
+-- where the account's totals live: appended per posting to account_balances, or one row in
+-- account_totals rewritten by posting. Off by default; set at creation, never changed.
 CREATE TABLE @extschema@.accounts (
     id                 uuid        PRIMARY KEY,
     created_at         timestamptz NOT NULL,
@@ -51,6 +53,7 @@ CREATE TABLE @extschema@.accounts (
 
     require_credit_balance boolean NOT NULL DEFAULT false,
     require_debit_balance  boolean NOT NULL DEFAULT false,
+    history                boolean NOT NULL DEFAULT false,
 
     CONSTRAINT accounts_one_balance_requirement
         CHECK (NOT (require_credit_balance AND require_debit_balance)),
@@ -114,8 +117,8 @@ CREATE TRIGGER transfers_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.transfers
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- An account's running totals after each transfer, two rows per transfer. version is previous
--- + 1, assigned under the account lock, so it is gapless. A writer on a stale snapshot computes
+-- Running totals after each transfer for accounts with history, one row per leg. version is
+-- previous + 1, assigned under the account lock, so it is gapless. A writer on a stale snapshot computes
 -- an existing version and fails on the primary key instead of forking the chain.
 CREATE TABLE @extschema@.account_balances (
     account_id     uuid          NOT NULL REFERENCES @extschema@.accounts(id),
@@ -128,35 +131,56 @@ CREATE TABLE @extschema@.account_balances (
     UNIQUE (transfer_id, account_id)
 );
 
--- Only post_transfers() may insert: that trigger runs at depth 1, its INSERT at 2.
-CREATE OR REPLACE FUNCTION @extschema@.raise_direct_insert()
+-- Only post_transfers() may write the balance stores: that trigger runs at depth 1, its
+-- statement at 2.
+CREATE OR REPLACE FUNCTION @extschema@.raise_direct_write()
 RETURNS TRIGGER AS $$
 BEGIN
     IF pg_trigger_depth() < 2 THEN
-        RAISE EXCEPTION '%.% is written by posting transfers; INSERTing into it directly is not allowed',
-            TG_TABLE_SCHEMA, TG_TABLE_NAME;
+        RAISE EXCEPTION '%.% is written by posting transfers; % is not allowed',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP;
     END IF;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER account_balances_no_direct_insert
+CREATE TRIGGER account_balances_no_direct_write
     BEFORE INSERT ON @extschema@.account_balances
-    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_write();
 
 CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- Posts the transfers a statement inserted, as one set-based INSERT: each transfer becomes a
--- debit leg and a credit leg, each touched account's latest totals are read once, and window
--- functions assign versions and running totals per account. The window orders an account's
--- legs by transfer id because running sums need some order; that is an implementation detail
--- of one statement, not an ordering guarantee, and insert in separate statements when one
--- transfer must post before the next. Any failure rolls back the whole statement.
+
+-- Current totals of accounts without history, one row each, created by the account's first
+-- posting and rewritten by every later one. Kept apart from accounts so the row posting locks
+-- and the transfer FKs reference is never updated. fillfactor leaves room for HOT updates.
+CREATE TABLE @extschema@.account_totals (
+    account_id     uuid          PRIMARY KEY REFERENCES @extschema@.accounts(id),
+    debits_posted  numeric(39,0) NOT NULL CHECK (debits_posted >= 0),
+    credits_posted numeric(39,0) NOT NULL CHECK (credits_posted >= 0)
+) WITH (fillfactor = 70);
+
+CREATE TRIGGER account_totals_no_direct_write
+    BEFORE INSERT OR UPDATE ON @extschema@.account_totals
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_write();
+
+CREATE TRIGGER account_totals_immutable
+    BEFORE DELETE OR TRUNCATE ON @extschema@.account_totals
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
+
+-- Posts the transfers a statement inserted in one statement: each transfer becomes a debit
+-- leg and a credit leg, each touched account's latest totals are read once from whichever
+-- store it uses, and window functions compute running totals per account. Legs of accounts
+-- with history are appended to account_balances; for the others the last running total is
+-- written to account_totals. The window orders an account's legs by transfer id because
+-- running sums need some order; that is an implementation detail of one statement, not an
+-- ordering guarantee, and insert in separate statements when one transfer must post before
+-- the next. Any failure rolls back the whole statement.
 --
--- The balance rules are checked here too, on the rows the INSERT returns, joined to accounts
--- once. accounts is immutable, so a row that passes stays passing.
+-- The balance rules are checked on every leg's running totals, so both kinds of account are
+-- judged per transfer. accounts is immutable, so a row that passes stays passing.
 CREATE OR REPLACE FUNCTION @extschema@.post_transfers()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -191,40 +215,60 @@ BEGIN
         SELECT credit_account_id, id, 0, amount
         FROM new_transfers
     ),
-    -- Latest totals per touched account. LATERAL with LIMIT 1 walks the PK backwards; a
-    -- DISTINCT ON over the table would read the account's whole history.
+    -- Latest totals per touched account, with its flags. LATERAL with LIMIT 1 walks the PK
+    -- backwards; a DISTINCT ON over the table would read the account's whole history.
     prev AS (
-        SELECT a.id AS account_id, b.version, b.debits_posted, b.credits_posted
-        FROM unnest(ids) AS a(id)
+        SELECT acc.id AS account_id, acc.history,
+               acc.require_credit_balance, acc.require_debit_balance,
+               COALESCE(b.version, 0)                          AS version,
+               COALESCE(b.debits_posted,  t.debits_posted,  0) AS debits_posted,
+               COALESCE(b.credits_posted, t.credits_posted, 0) AS credits_posted
+        FROM @extschema@.accounts acc
         LEFT JOIN LATERAL (
             SELECT ab.version, ab.debits_posted, ab.credits_posted
             FROM @extschema@.account_balances ab
-            WHERE ab.account_id = a.id
+            WHERE acc.history AND ab.account_id = acc.id
             ORDER BY ab.version DESC
             LIMIT 1
         ) b ON true
+        LEFT JOIN @extschema@.account_totals t
+            ON NOT acc.history AND t.account_id = acc.id
+        WHERE acc.id = ANY(ids)
     ),
+    -- Every leg's running totals, computed once for both kinds of account.
     posted AS (
+        SELECT
+            l.account_id, l.transfer_id,
+            p.history, p.require_credit_balance, p.require_debit_balance,
+            p.version        + row_number()  OVER w AS version,
+            p.debits_posted  + sum(l.debit)  OVER w AS debits_posted,
+            p.credits_posted + sum(l.credit) OVER w AS credits_posted,
+            row_number() OVER w = count(*) OVER (PARTITION BY l.account_id) AS is_last
+        FROM legs l
+        JOIN prev p USING (account_id)
+        WINDOW w AS (PARTITION BY l.account_id ORDER BY l.transfer_id ROWS UNBOUNDED PRECEDING)
+    ),
+    appended AS (
         INSERT INTO @extschema@.account_balances
             (account_id, version, transfer_id, debits_posted, credits_posted)
-        SELECT
-            l.account_id,
-            COALESCE(p.version, 0)        + row_number()  OVER w,
-            l.transfer_id,
-            COALESCE(p.debits_posted, 0)  + sum(l.debit)  OVER w,
-            COALESCE(p.credits_posted, 0) + sum(l.credit) OVER w
-        FROM legs l
-        LEFT JOIN prev p USING (account_id)
-        WINDOW w AS (PARTITION BY l.account_id ORDER BY l.transfer_id ROWS UNBOUNDED PRECEDING)
-        RETURNING account_id, transfer_id, debits_posted, credits_posted
+        SELECT account_id, version, transfer_id, debits_posted, credits_posted
+        FROM posted
+        WHERE history
+    ),
+    rewritten AS (
+        INSERT INTO @extschema@.account_totals (account_id, debits_posted, credits_posted)
+        SELECT account_id, debits_posted, credits_posted
+        FROM posted
+        WHERE NOT history AND is_last
+        ON CONFLICT (account_id) DO UPDATE
+            SET debits_posted  = EXCLUDED.debits_posted,
+                credits_posted = EXCLUDED.credits_posted
     )
-    SELECT p.account_id, p.transfer_id, p.debits_posted, p.credits_posted,
-           a.require_credit_balance, a.require_debit_balance
+    SELECT account_id, transfer_id, debits_posted, credits_posted, require_credit_balance
     INTO bad
-    FROM posted p
-    JOIN @extschema@.accounts a ON a.id = p.account_id
-    WHERE (a.require_credit_balance AND p.debits_posted > p.credits_posted)
-       OR (a.require_debit_balance  AND p.credits_posted > p.debits_posted)
+    FROM posted
+    WHERE (require_credit_balance AND debits_posted > credits_posted)
+       OR (require_debit_balance  AND credits_posted > debits_posted)
     LIMIT 1;
 
     IF FOUND THEN
@@ -250,20 +294,24 @@ CREATE TRIGGER transfers_post
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.post_transfers();
 
 
--- Every account's latest totals, zeros if never posted to. Upgrades can only append columns.
+-- Every account's latest totals from whichever store it uses, zeros if never posted to.
+-- version is 0 for accounts without history. Upgrades can only append columns.
 CREATE VIEW @extschema@.current_balances AS
 SELECT
     a.id        AS account_id,
     a.ledger_id,
-    COALESCE(b.version,        0) AS version,
-    COALESCE(b.debits_posted,  0) AS debits_posted,
-    COALESCE(b.credits_posted, 0) AS credits_posted,
-    COALESCE(b.debits_posted,  0) - COALESCE(b.credits_posted, 0) AS balance
+    COALESCE(b.version, 0)                          AS version,
+    COALESCE(b.debits_posted,  t.debits_posted,  0) AS debits_posted,
+    COALESCE(b.credits_posted, t.credits_posted, 0) AS credits_posted,
+    COALESCE(b.debits_posted,  t.debits_posted,  0)
+      - COALESCE(b.credits_posted, t.credits_posted, 0) AS balance
 FROM @extschema@.accounts a
 LEFT JOIN LATERAL (
     SELECT ab.version, ab.debits_posted, ab.credits_posted
     FROM @extschema@.account_balances ab
-    WHERE ab.account_id = a.id
+    WHERE a.history AND ab.account_id = a.id
     ORDER BY ab.version DESC
     LIMIT 1
-) b ON true;
+) b ON true
+LEFT JOIN @extschema@.account_totals t
+    ON NOT a.history AND t.account_id = a.id;

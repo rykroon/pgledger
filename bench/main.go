@@ -55,6 +55,7 @@ type config struct {
 	resetExisting bool
 	schema        string
 	extDir        string
+	historyRatio  float64
 }
 
 func parseFlags() (*config, error) {
@@ -85,6 +86,7 @@ func parseFlags() (*config, error) {
 	flag.BoolVar(&c.resetExisting, "reset-existing", false, "with -dsn: acknowledge that pgledger is dropped and reinstalled there")
 	flag.StringVar(&c.schema, "schema", "ledger", "schema to install pgledger into")
 	flag.StringVar(&c.extDir, "ext-dir", "", "directory holding pgledger.control (default: nearest ancestor of the cwd)")
+	flag.Float64Var(&c.historyRatio, "history-ratio", -1, "fraction of normal accounts created with history = true; hot and reserve accounts always have it; -1 leaves the column at its default")
 	flag.Parse()
 
 	if c.clients < 1 || c.ledgers < 1 || c.batch < 1 || c.hotAccounts < 0 {
@@ -114,6 +116,9 @@ func parseFlags() (*config, error) {
 	}
 	if c.dsn != "" && !c.resetExisting {
 		return nil, errors.New("-dsn drops and reinstalls pgledger in that database; pass -reset-existing to confirm")
+	}
+	if c.historyRatio > 1 {
+		return nil, errors.New("history-ratio must be -1 or in [0,1]")
 	}
 	if c.seed == 0 {
 		c.seed = time.Now().UnixNano()

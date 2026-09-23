@@ -28,6 +28,7 @@ go run . -ledgers 8 -ledger-skew 1.2 -json # traffic concentrated on a few ledge
 | `-accounts` | 1000 | total accounts across all ledgers |
 | `-hot-ratio` | 0 | fraction of transfers with one side on a hot account of its ledger. Posting serializes per account, so this is the contention knob |
 | `-hot-accounts` | 1 | hot accounts per ledger |
+| `-history-ratio` | -1 | fraction of normal accounts created with `history = true`; hot and reserve accounts always keep history. -1 leaves the column at the schema default (off), so the default run measures accounts without history |
 | `-rules` | off | accounts get `require_debit_balance`; a per-ledger unrestricted reserve funds each account with `-fund` before the timed run. Exercises `check_balance_rule` and the rollback path. Rejected batches are counted, never retried |
 | `-amount-max` | 100 | amounts are uniform in `1..amount-max`; raise it past `-fund` to force rejections |
 | `-uuid` | v7 | `v4` (random) or `v7` (time-ordered) ids, which changes how the uuid btrees grow |
@@ -70,9 +71,11 @@ verify: OK
   `40P01` a deadlock, `23505` a unique violation. Single-statement posting must never deadlock.
 - **server** shows deltas from `pg_stat_database` around the timed run, and relation sizes at the
   end so the cost of the indexes is visible.
-- **verify** checks that every ledger sums to zero, that there is one transfer row and two
-  `account_balances` rows per posted transfer (funding and warmup included), that each account's
-  `version` is gapless, and that no deadlock occurred. A failed check exits with status 3.
+- **verify** checks that every ledger sums to zero, that there is one transfer row per posted
+  transfer (funding and warmup included), that every account's current totals equal the sums
+  recomputed from `transfers`, that `account_balances` holds exactly one row per leg on an
+  account with history, that each account's `version` is gapless, and that no deadlock
+  occurred. A failed check exits with status 3.
 
 Ledgers and accounts are created fresh every run, and every row carries the run id in
 `external_id`. Because the tables are append-only, a reused container is cleared by dropping
