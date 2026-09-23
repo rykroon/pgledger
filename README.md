@@ -187,3 +187,15 @@ transaction already holds and never acquires one out of order. This is the same 
 - A transfer that would break a balance rule is rejected.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected, and so is
   inserting into `ledger.account_balances` directly.
+
+## Benchmark
+
+`bench/` holds a Go program that starts a throwaway `supabase/postgres` container, installs the
+extension from the working tree, and posts transfers from concurrent clients:
+
+```sh
+cd bench && go run . -clients 16 -batch 10 -hot-ratio 0.2
+```
+
+It reports transfers/s, statement latency, errors by SQLSTATE, and verifies the ledger
+afterwards. See [bench/README.md](bench/README.md) for every knob.
