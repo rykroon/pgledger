@@ -59,7 +59,6 @@ CREATE TABLE @extschema@.accounts (
     UNIQUE (id, ledger_id)
 );
 
--- UNIQUE (id, ledger_id) leads with id, so it can't serve ledger_id lookups.
 CREATE INDEX accounts_created_at_idx ON @extschema@.accounts (created_at);
 CREATE INDEX accounts_ledger_id_idx ON @extschema@.accounts (ledger_id);
 CREATE INDEX accounts_code_idx ON @extschema@.accounts (code);
@@ -77,12 +76,11 @@ CREATE TRIGGER accounts_immutable
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
 -- Value flows credit -> debit; the composite FKs make a cross-ledger transfer unwritable.
--- seq is assigned as each row is inserted, so a multi-row INSERT numbers its rows in the order
--- they were written and post_transfers() applies them in that order. It is allocation order,
--- not commit order: a lower seq can commit later, so it is a sort key, not a change cursor.
+-- A multi-row INSERT posts its rows in no particular order: the AFTER STATEMENT trigger reads
+-- them from a transition table, which has no defined order. When one transfer must post before
+-- the next, insert them in separate statements.
 CREATE TABLE @extschema@.transfers (
     id                 uuid          PRIMARY KEY,
-    seq                bigint        GENERATED ALWAYS AS IDENTITY UNIQUE,
     created_at         timestamptz   NOT NULL,
     ledger_id          uuid          NOT NULL,
     debit_account_id   uuid          NOT NULL,
@@ -135,7 +133,7 @@ CREATE OR REPLACE FUNCTION @extschema@.raise_direct_insert()
 RETURNS TRIGGER AS $$
 BEGIN
     IF pg_trigger_depth() < 2 THEN
-        RAISE EXCEPTION '%.% is written by posting transfers; INSERT into it directly is not allowed',
+        RAISE EXCEPTION '%.% is written by posting transfers; INSERTing into it directly is not allowed',
             TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
     RETURN NULL;
@@ -182,8 +180,9 @@ CREATE TRIGGER account_balances_check_balance_rule
     FOR EACH ROW EXECUTE FUNCTION @extschema@.check_balance_rule();
 
 
--- Posts the transfers a statement inserted, in seq order. Order changes outcomes (a deposit
--- then a withdrawal can succeed where the reverse fails); any failure rolls back the statement.
+-- Posts the transfers a statement inserted. The transition table has no defined order, so rows
+-- within one statement post in no particular order; insert in separate statements when one
+-- transfer must post before the next. Any failure rolls back the whole statement.
 CREATE OR REPLACE FUNCTION @extschema@.post_transfers()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -216,7 +215,7 @@ BEGIN
     ORDER BY id
     FOR NO KEY UPDATE;
 
-    FOR t IN SELECT * FROM new_transfers ORDER BY seq LOOP
+    FOR t IN SELECT * FROM new_transfers LOOP
         SELECT * INTO debit_prev FROM @extschema@.account_balances
         WHERE account_id = t.debit_account_id
         ORDER BY version DESC

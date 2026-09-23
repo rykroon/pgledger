@@ -54,9 +54,13 @@ VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id.
 ```
 
 A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
-and enforces the balance rules. Post a batch as a single multi-row `INSERT`: the rows are
-applied in the order you wrote them, each posted in full before the next, and a failure
-anywhere rolls back the whole statement. A batch may span ledgers.
+and enforces the balance rules. A multi-row `INSERT` posts every row, but in no defined
+order, and a failure anywhere rolls back the whole statement. A batch may span ledgers.
+
+When one transfer must post before the next, insert them in separate statements in one
+transaction. Order changes outcomes: a deposit followed by a withdrawal can succeed where
+the reverse fails. Posting across several statements carries a deadlock caveat, covered
+under [Concurrency](#concurrency).
 
 A retry is safe with `ON CONFLICT (id) DO NOTHING`: rows that already exist are skipped
 and never posted twice.
@@ -139,10 +143,10 @@ them but never interprets them:
   are applied in. `created_at` is always set by the ledger to the time of the inserting
   transaction, never by you. Transfers posted in one transaction share it.
 
-Transfers also carry `seq`, assigned by the ledger as each row is inserted. It is what
-orders a multi-row `INSERT`, and a tiebreak for listings that share `created_at`. It is
-allocation order, not commit order: a lower `seq` can commit later, so don't use it as a
-change cursor. For `INSERT ... SELECT`, add an `ORDER BY` to the `SELECT` to control the order. Within one account, `ledger.account_balances.version` is the order of record.
+Transfers have no total order. Within one account, `ledger.account_balances.version` is the
+order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
+for a stable result, bearing in mind that `id` is an arbitrary tiebreak and every transfer
+in one transaction shares `created_at`.
 
 ## Concurrency
 
@@ -152,11 +156,25 @@ gapless and the balance rules honest. Transfers on disjoint accounts post in par
 creating accounts is never blocked.
 
 Because the locks are taken in `id` order, two concurrent statements that touch the same
-accounts cannot deadlock, however their rows are ordered. That holds within a single
-statement. A transaction that posts in several statements accumulates locks in statement
+accounts cannot deadlock, however their rows are ordered. That guarantee covers a single
+statement only. A transaction that posts in several statements accumulates locks in statement
 order, so two transactions reaching the same accounts through separate statements, in
-opposite order, can deadlock and one will be rolled back with SQLSTATE `40P01`. Post
-everything a transaction needs in one `INSERT` to avoid it.
+opposite order, can deadlock and one will be rolled back with SQLSTATE `40P01`.
+
+This matters whenever transfers must be ordered, because ordering them means separate
+statements. Lock every account the transaction will touch up front, in `id` order, before
+the first `INSERT`:
+
+```sql
+SELECT id FROM ledger.accounts
+WHERE id IN ('...account-a...', '...account-b...', '...account-c...')
+ORDER BY id
+FOR NO KEY UPDATE;
+```
+
+The locks are held until the transaction ends, so each posting re-requests locks the
+transaction already holds and never acquires one out of order. This is the same technique as
+[Draining an account](#draining-an-account), widened to every account in the sequence.
 
 ## Constraints
 
