@@ -9,6 +9,8 @@ $$ LANGUAGE plpgsql;
 
 
 -- Stamps created_at; callers can't supply it (a generated column can't use now()).
+-- clock_timestamp(), not now(), so rows in one transaction or statement get their own times.
+-- Mostly unique, not unique: two rows can share a microsecond, and the wall clock can step.
 CREATE OR REPLACE FUNCTION @extschema@.set_created_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -16,7 +18,7 @@ BEGIN
         RAISE EXCEPTION '%.%.created_at is assigned by the ledger and cannot be supplied',
             TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
-    NEW.created_at := now();
+    NEW.created_at := clock_timestamp();
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -151,9 +153,10 @@ CREATE TRIGGER account_balances_immutable
 -- Posts the transfers a statement inserted, as one set-based INSERT: each transfer becomes a
 -- debit leg and a credit leg, each touched account's latest totals are read once, and window
 -- functions assign versions and running totals per account. The window orders an account's
--- legs by transfer id because running sums need some order; that is an implementation detail
--- of one statement, not an ordering guarantee, and insert in separate statements when one
--- transfer must post before the next. Any failure rolls back the whole statement.
+-- legs by created_at, then id for ties, which in practice is the order the statement produced
+-- its rows (VALUES order, or a SELECT's ORDER BY). Postgres does not promise that order, so it
+-- is not an ordering guarantee: insert in separate statements when one transfer must post
+-- before the next. Any failure rolls back the whole statement.
 --
 -- The balance rules are checked here too, on the rows the INSERT returns, joined to accounts
 -- once. accounts is immutable, so a row that passes stays passing.
@@ -184,11 +187,11 @@ BEGIN
     FOR NO KEY UPDATE;
 
     WITH legs AS (
-        SELECT debit_account_id AS account_id, id AS transfer_id,
+        SELECT debit_account_id AS account_id, id AS transfer_id, created_at,
                amount AS debit, 0::numeric AS credit
         FROM new_transfers
         UNION ALL
-        SELECT credit_account_id, id, 0, amount
+        SELECT credit_account_id, id, created_at, 0, amount
         FROM new_transfers
     ),
     -- Latest totals per touched account. LATERAL with LIMIT 1 walks the PK backwards; a
@@ -215,7 +218,7 @@ BEGIN
             COALESCE(p.credits_posted, 0) + sum(l.credit) OVER w
         FROM legs l
         LEFT JOIN prev p USING (account_id)
-        WINDOW w AS (PARTITION BY l.account_id ORDER BY l.transfer_id ROWS UNBOUNDED PRECEDING)
+        WINDOW w AS (PARTITION BY l.account_id ORDER BY l.created_at, l.transfer_id ROWS UNBOUNDED PRECEDING)
         RETURNING account_id, transfer_id, debits_posted, credits_posted
     )
     SELECT p.account_id, p.transfer_id, p.debits_posted, p.credits_posted,

@@ -54,8 +54,10 @@ VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id.
 ```
 
 A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
-and enforces the balance rules. A multi-row `INSERT` posts every row, but in no defined
-order, and a failure anywhere rolls back the whole statement. A batch may span ledgers.
+and enforces the balance rules. A multi-row `INSERT` posts every row, and a failure anywhere
+rolls back the whole statement. A batch may span ledgers. Rows post in `created_at` order,
+which in practice is the order the statement produced them, but Postgres doesn't guarantee
+that order, so don't rely on it.
 
 When one transfer must post before the next, insert them in separate statements in one
 transaction. Order changes outcomes: a deposit followed by a withdrawal can succeed where
@@ -140,13 +142,15 @@ them but never interprets them:
   customer, an order, or a group of related transfers.
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
   date or the original time of an imported record. It doesn't change the order balances
-  are applied in. `created_at` is always set by the ledger to the time of the inserting
-  transaction, never by you. Transfers posted in one transaction share it.
+  are applied in. `created_at` is always set by the ledger, never by you, to the clock time
+  the row was inserted. Rows get their own times, even within one statement, but it is not
+  unique: two rows can share a microsecond.
 
 Transfers have no total order. Within one account, `ledger.account_balances.version` is the
 order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
-for a stable result, bearing in mind that `id` is an arbitrary tiebreak and every transfer
-in one transaction shares `created_at`.
+for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `created_at` is
+taken before posting locks the accounts, so across transactions it can disagree with the
+order transfers were actually posted in.
 
 ## Concurrency
 
