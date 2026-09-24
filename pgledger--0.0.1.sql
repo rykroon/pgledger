@@ -45,7 +45,7 @@ CREATE TABLE @extschema@.accounts (
     id                 uuid        PRIMARY KEY,
     created_at         timestamptz NOT NULL,
     ledger_id          uuid        NOT NULL REFERENCES @extschema@.ledgers(id),
-    code               integer     NOT NULL CHECK (code > 0),
+    code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
     external_id        uuid,
     external_timestamp timestamptz,
 
@@ -86,7 +86,7 @@ CREATE TABLE @extschema@.transfers (
     debit_account_id   uuid          NOT NULL,
     credit_account_id  uuid          NOT NULL,
     amount             numeric(39,0) NOT NULL CHECK (amount > 0),
-    code               integer       NOT NULL CHECK (code > 0),
+    code               integer       NOT NULL CHECK (code BETWEEN 1 AND 65535),
     external_id        uuid,
     external_timestamp timestamptz,
 
