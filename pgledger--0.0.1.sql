@@ -148,52 +148,20 @@ CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- Enforced here rather than in post_transfers() so the rule holds whatever writes the row. The
--- rule is a predicate on the row's own totals, so the trigger needn't know which side of the
--- transfer the row is. accounts is immutable, so a row that passes stays passing.
-CREATE OR REPLACE FUNCTION @extschema@.check_balance_rule()
-RETURNS TRIGGER AS $$
-DECLARE
-    require_credit boolean;
-    require_debit  boolean;
-BEGIN
-    SELECT require_credit_balance, require_debit_balance
-    INTO require_credit, require_debit
-    FROM @extschema@.accounts WHERE id = NEW.account_id;
-
-    IF require_credit AND NEW.debits_posted > NEW.credits_posted THEN
-        RAISE EXCEPTION 'account % is credit-normal: transfer % would put debits % past credits %',
-            NEW.account_id, NEW.transfer_id, NEW.debits_posted, NEW.credits_posted;
-    END IF;
-
-    IF require_debit AND NEW.credits_posted > NEW.debits_posted THEN
-        RAISE EXCEPTION 'account % is debit-normal: transfer % would put credits % past debits %',
-            NEW.account_id, NEW.transfer_id, NEW.credits_posted, NEW.debits_posted;
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER account_balances_check_balance_rule
-    BEFORE INSERT ON @extschema@.account_balances
-    FOR EACH ROW EXECUTE FUNCTION @extschema@.check_balance_rule();
-
-
--- Posts the transfers a statement inserted. The transition table has no defined order, so rows
--- within one statement post in no particular order; insert in separate statements when one
+-- Posts the transfers a statement inserted, as one set-based INSERT: each transfer becomes a
+-- debit leg and a credit leg, each touched account's latest totals are read once, and window
+-- functions assign versions and running totals per account. The window orders an account's
+-- legs by transfer id because running sums need some order; that is an implementation detail
+-- of one statement, not an ordering guarantee, and insert in separate statements when one
 -- transfer must post before the next. Any failure rolls back the whole statement.
+--
+-- The balance rules are checked here too, on the rows the INSERT returns, joined to accounts
+-- once. accounts is immutable, so a row that passes stays passing.
 CREATE OR REPLACE FUNCTION @extschema@.post_transfers()
 RETURNS TRIGGER AS $$
 DECLARE
-    ids            uuid[];
-    t              @extschema@.transfers%ROWTYPE;
-    debit_prev     @extschema@.account_balances%ROWTYPE;
-    credit_prev    @extschema@.account_balances%ROWTYPE;
-    debit_debits   numeric(39,0);
-    debit_credits  numeric(39,0);
-    credit_debits  numeric(39,0);
-    credit_credits numeric(39,0);
+    ids uuid[];
+    bad record;
 BEGIN
     -- Lock every account the statement touches, in id order, so two concurrent statements
     -- sharing accounts cannot deadlock. Holds within one statement only: post a batch as one
@@ -215,32 +183,66 @@ BEGIN
     ORDER BY id
     FOR NO KEY UPDATE;
 
-    FOR t IN SELECT * FROM new_transfers LOOP
-        SELECT * INTO debit_prev FROM @extschema@.account_balances
-        WHERE account_id = t.debit_account_id
-        ORDER BY version DESC
-        LIMIT 1;
-
-        SELECT * INTO credit_prev FROM @extschema@.account_balances
-        WHERE account_id = t.credit_account_id
-        ORDER BY version DESC
-        LIMIT 1;
-
-        debit_debits   := COALESCE(debit_prev.debits_posted, 0) + t.amount;
-        debit_credits  := COALESCE(debit_prev.credits_posted, 0);
-        credit_debits  := COALESCE(credit_prev.debits_posted, 0);
-        credit_credits := COALESCE(credit_prev.credits_posted, 0) + t.amount;
-
+    WITH legs AS (
+        SELECT debit_account_id AS account_id, id AS transfer_id,
+               amount AS debit, 0::numeric AS credit
+        FROM new_transfers
+        UNION ALL
+        SELECT credit_account_id, id, 0, amount
+        FROM new_transfers
+    ),
+    -- Latest totals per touched account. LATERAL with LIMIT 1 walks the PK backwards; a
+    -- DISTINCT ON over the table would read the account's whole history.
+    prev AS (
+        SELECT a.id AS account_id, b.version, b.debits_posted, b.credits_posted
+        FROM unnest(ids) AS a(id)
+        LEFT JOIN LATERAL (
+            SELECT ab.version, ab.debits_posted, ab.credits_posted
+            FROM @extschema@.account_balances ab
+            WHERE ab.account_id = a.id
+            ORDER BY ab.version DESC
+            LIMIT 1
+        ) b ON true
+    ),
+    posted AS (
         INSERT INTO @extschema@.account_balances
             (account_id, version, transfer_id, debits_posted, credits_posted)
-        VALUES
-            (t.debit_account_id,  COALESCE(debit_prev.version, 0) + 1,  t.id, debit_debits,  debit_credits),
-            (t.credit_account_id, COALESCE(credit_prev.version, 0) + 1, t.id, credit_debits, credit_credits);
-    END LOOP;
+        SELECT
+            l.account_id,
+            COALESCE(p.version, 0)        + row_number()  OVER w,
+            l.transfer_id,
+            COALESCE(p.debits_posted, 0)  + sum(l.debit)  OVER w,
+            COALESCE(p.credits_posted, 0) + sum(l.credit) OVER w
+        FROM legs l
+        LEFT JOIN prev p USING (account_id)
+        WINDOW w AS (PARTITION BY l.account_id ORDER BY l.transfer_id ROWS UNBOUNDED PRECEDING)
+        RETURNING account_id, transfer_id, debits_posted, credits_posted
+    )
+    SELECT p.account_id, p.transfer_id, p.debits_posted, p.credits_posted,
+           a.require_credit_balance, a.require_debit_balance
+    INTO bad
+    FROM posted p
+    JOIN @extschema@.accounts a ON a.id = p.account_id
+    WHERE (a.require_credit_balance AND p.debits_posted > p.credits_posted)
+       OR (a.require_debit_balance  AND p.credits_posted > p.debits_posted)
+    LIMIT 1;
+
+    IF FOUND THEN
+        IF bad.require_credit_balance THEN
+            RAISE EXCEPTION 'account % is credit-normal: transfer % would put debits % past credits %',
+                bad.account_id, bad.transfer_id, bad.debits_posted, bad.credits_posted;
+        END IF;
+        RAISE EXCEPTION 'account % is debit-normal: transfer % would put credits % past debits %',
+            bad.account_id, bad.transfer_id, bad.credits_posted, bad.debits_posted;
+    END IF;
 
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+-- The posting statement costs more to plan than to run, and the planner keeps re-planning it
+-- because a custom plan for a two-element array always looks cheaper than the generic one.
+-- Plan it once; every access path in it is an index lookup whatever the batch size.
+SET plan_cache_mode = force_generic_plan;
 
 CREATE TRIGGER transfers_post
     AFTER INSERT ON @extschema@.transfers
