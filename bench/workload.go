@@ -105,15 +105,21 @@ func (g *gen) next() transfer {
 	}
 }
 
-// One prepared statement whatever the batch size; pgx caches it per connection.
+// One prepared statement whatever the batch size; pgx caches it per connection. Posting
+// goes through create_transfers(), which returns a result per row instead of failing the
+// statement; the composite array is built server-side so the client keeps its parallel-array
+// bind parameters, and the result is folded to a count of rejected rows.
 func insertSQL(schema string) string {
-	return fmt.Sprintf(`INSERT INTO %s.transfers
-    (id, ledger_id, debit_account_id, credit_account_id, amount, code, external_id)
-SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[], $5::numeric[], $6::int[], $7::uuid[])`,
-		pgx.Identifier{schema}.Sanitize())
+	q := pgx.Identifier{schema}.Sanitize()
+	return fmt.Sprintf(`SELECT count(*) FILTER (WHERE code <> 'ok')
+FROM %s.create_transfers(ARRAY(
+    SELECT ROW(t.id, t.ledger, t.debit, t.credit, t.amount, t.code, t.ext, NULL)::%s.transfer_input
+    FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[], $5::numeric[], $6::int[], $7::uuid[])
+         AS t(id, ledger, debit, credit, amount, code, ext)
+))`, q, q)
 }
 
-func postBatch(ctx context.Context, conn *pgx.Conn, sql string, batch []transfer, runID uuid.UUID) error {
+func postBatch(ctx context.Context, conn *pgx.Conn, sql string, batch []transfer, runID uuid.UUID) (int64, error) {
 	n := len(batch)
 	ids := make([]uuid.UUID, n)
 	ledgers := make([]uuid.UUID, n)
@@ -126,8 +132,9 @@ func postBatch(ctx context.Context, conn *pgx.Conn, sql string, batch []transfer
 		ids[i], ledgers[i], debits[i], credits[i] = t.id, t.ledger, t.debit, t.credit
 		amounts[i], codes[i], ext[i] = t.amount, t.code, runID
 	}
-	_, err := conn.Exec(ctx, sql, ids, ledgers, debits, credits, amounts, codes, ext)
-	return err
+	var rejected int64
+	err := conn.QueryRow(ctx, sql, ids, ledgers, debits, credits, amounts, codes, ext).Scan(&rejected)
+	return rejected, err
 }
 
 type phaseResult struct {
@@ -150,8 +157,9 @@ func sqlstate(err error) string {
 }
 
 // runPhase posts n transfers split evenly across the client connections, each statement its
-// own transaction. Failed statements are counted by SQLSTATE and never retried, so a batch
-// rejected by a balance rule loses all its rows, as it would in production.
+// own transaction. A batch is no longer all-or-nothing: create_transfers() rejects rows
+// individually, counted under the pseudo-code "rejected". Whole-statement failures are still
+// counted by SQLSTATE and never retried.
 func runPhase(ctx context.Context, cfg *config, conns []*pgx.Conn, w *world, n int, seed int64) phaseResult {
 	sql := insertSQL(cfg.schema)
 	results := make([]phaseResult, len(conns))
@@ -180,13 +188,16 @@ func runPhase(ctx context.Context, cfg *config, conns []*pgx.Conn, w *world, n i
 					batch = append(batch, g.next())
 				}
 				t0 := time.Now()
-				err := postBatch(ctx, conn, sql, batch, w.runID)
+				rejected, err := postBatch(ctx, conn, sql, batch, w.runID)
 				res.lat = append(res.lat, time.Since(t0))
 				res.statements++
 				res.attempted += int64(k)
 				remaining -= k
 				if err == nil {
-					res.posted += int64(k)
+					res.posted += int64(k) - rejected
+					if rejected > 0 {
+						res.errs["rejected"] += int(rejected)
+					}
 					continue
 				}
 				res.failed++

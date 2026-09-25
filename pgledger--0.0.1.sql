@@ -24,6 +24,22 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- Only create_transfers() may write transfers and account_balances: it sets a
+-- transaction-local GUC around its inserts, and anything arriving without it is rejected.
+-- (This replaced a pg_trigger_depth() guard: the function's inserts run at depth 0, so
+-- trigger depth can no longer tell posting apart from a direct INSERT.)
+CREATE OR REPLACE FUNCTION @extschema@.raise_direct_insert()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF current_setting('pgledger.posting', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION '%.% is written by %.create_transfers(); INSERTing into it directly is not allowed',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_TABLE_SCHEMA;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+
 -- Deliberately bare; mutable attributes belong in the caller's own table keyed by ledger_id.
 CREATE TABLE @extschema@.ledgers (
     id         uuid        PRIMARY KEY,
@@ -57,7 +73,8 @@ CREATE TABLE @extschema@.accounts (
     CONSTRAINT accounts_one_balance_requirement
         CHECK (NOT (require_credit_balance AND require_debit_balance)),
 
-    -- Target of the composite FKs that keep a transfer on one ledger.
+    -- Was the target of the composite FKs that kept a transfer on one ledger; kept in case
+    -- they return.
     UNIQUE (id, ledger_id)
 );
 
@@ -77,10 +94,10 @@ CREATE TRIGGER accounts_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.accounts
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- Value flows credit -> debit; the composite FKs make a cross-ledger transfer unwritable.
--- A multi-row INSERT posts its rows in no particular order: the AFTER STATEMENT trigger reads
--- them from a transition table, which has no defined order. When one transfer must post before
--- the next, insert them in separate statements.
+-- Value flows credit -> debit. Transfers are written only by create_transfers(), which
+-- validates account existence and same-ledger membership itself before inserting, so the
+-- composite FKs that used to enforce them are gone. The CHECKs stay as backstops: they can
+-- only fire if create_transfers() misvalidates, and then failing the whole call is right.
 CREATE TABLE @extschema@.transfers (
     id                 uuid          PRIMARY KEY,
     created_at         timestamptz   NOT NULL,
@@ -92,10 +109,7 @@ CREATE TABLE @extschema@.transfers (
     external_id        uuid,
     external_timestamp timestamptz,
 
-    CHECK (debit_account_id <> credit_account_id),
-
-    FOREIGN KEY (debit_account_id, ledger_id)  REFERENCES @extschema@.accounts (id, ledger_id),
-    FOREIGN KEY (credit_account_id, ledger_id) REFERENCES @extschema@.accounts (id, ledger_id)
+    CHECK (debit_account_id <> credit_account_id)
 );
 
 CREATE INDEX transfers_debit_account_id_idx ON @extschema@.transfers (debit_account_id);
@@ -107,6 +121,10 @@ CREATE INDEX transfers_external_id_idx ON @extschema@.transfers (external_id)
     WHERE external_id IS NOT NULL;
 CREATE INDEX transfers_external_timestamp_idx ON @extschema@.transfers (external_timestamp)
     WHERE external_timestamp IS NOT NULL;
+
+CREATE TRIGGER transfers_no_direct_insert
+    BEFORE INSERT ON @extschema@.transfers
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
 
 CREATE TRIGGER transfers_set_created_at
     BEFORE INSERT ON @extschema@.transfers
@@ -130,18 +148,6 @@ CREATE TABLE @extschema@.account_balances (
     UNIQUE (transfer_id, account_id)
 );
 
--- Only post_transfers() may insert: that trigger runs at depth 1, its INSERT at 2.
-CREATE OR REPLACE FUNCTION @extschema@.raise_direct_insert()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF pg_trigger_depth() < 2 THEN
-        RAISE EXCEPTION '%.% is written by posting transfers; INSERTing into it directly is not allowed',
-            TG_TABLE_SCHEMA, TG_TABLE_NAME;
-    END IF;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
 CREATE TRIGGER account_balances_no_direct_insert
     BEFORE INSERT ON @extschema@.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
@@ -150,107 +156,245 @@ CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- Posts the transfers a statement inserted, as one set-based INSERT: each transfer becomes a
--- debit leg and a credit leg, each touched account's latest totals are read once, and window
--- functions assign versions and running totals per account. The window orders an account's
--- legs by created_at, then id for ties, which in practice is the order the statement produced
--- its rows (VALUES order, or a SELECT's ORDER BY). Postgres does not promise that order, so it
--- is not an ordering guarantee: insert in separate statements when one transfer must post
--- before the next. Any failure rolls back the whole statement.
---
--- The balance rules are checked here too, on the rows the INSERT returns, joined to accounts
--- once. accounts is immutable, so a row that passes stays passing.
-CREATE OR REPLACE FUNCTION @extschema@.post_transfers()
-RETURNS TRIGGER AS $$
-DECLARE
-    ids uuid[];
-    bad record;
-BEGIN
-    -- Lock every account the statement touches, in id order, so two concurrent statements
-    -- sharing accounts cannot deadlock. Holds within one statement only: post a batch as one
-    -- INSERT. NO KEY UPDATE because the FK checks hold KEY SHARE, which FOR UPDATE conflicts
-    -- with. Under REPEATABLE READ the snapshot can predate the lock; the PK catches that.
-    SELECT array_agg(id) INTO ids FROM (
-        SELECT debit_account_id AS id FROM new_transfers
-        UNION
-        SELECT credit_account_id FROM new_transfers
-    ) touched;
 
-    -- Nothing inserted, e.g. every row skipped by ON CONFLICT DO NOTHING.
-    IF ids IS NULL THEN
-        RETURN NULL;
+-- One row of a create_transfers() batch. Composite types can't carry constraints, so every
+-- rule is checked by create_transfers() and reported as a result code, never an exception.
+CREATE TYPE @extschema@.transfer_input AS (
+    id                 uuid,
+    ledger_id          uuid,
+    debit_account_id   uuid,
+    credit_account_id  uuid,
+    amount             numeric,
+    code               integer,
+    external_id        uuid,
+    external_timestamp timestamptz
+);
+
+-- Posts a batch with a result per transfer, TigerBeetle-style: a rejected row does not abort
+-- its neighbors. Returns one (ord, transfer_id, code) row per input element, in input order;
+-- code is 'ok' or the first rule the row broke:
+--
+--   phase 1, values (the row alone):     id_not_set, amount_must_be_positive,
+--       code_invalid, accounts_must_be_different
+--   phase 2, relationships (lookups):     id_already_exists, ledger_not_found,
+--       debit_account_not_found, credit_account_not_found,
+--       debit_account_ledger_mismatch, credit_account_ledger_mismatch
+--   phase 3, balance rules (stateful):    exceeds_credits, exceeds_debits
+--
+-- Validation runs in those three phases, and only rows that clear a phase reach the next;
+-- a row's code is the first check it failed. Everything is computed before anything is
+-- written: phases 1 and 2 in one pass, then balance rules, then a single insert of the
+-- accepted rows into transfers and account_balances. Unlike the old AFTER INSERT trigger, batch order is explicit here — rows
+-- post in array order, and running balances follow it.
+--
+-- Balance rules are sequential: a rejected transfer is excluded from the balances later rows
+-- see, and its other leg vanishes with it, which plain window functions can't express. So:
+-- evict and retry. Each pass computes running balances for all remaining candidates in one
+-- set-based statement; if any rule breaks, the EARLIEST violator is evicted and the pass
+-- rerun. The state before the first violator is identical to one-at-a-time processing, so
+-- k rejections cost k+1 passes and reproduce exactly sequential semantics.
+--
+-- A repeated id within one batch follows TigerBeetle: only the earliest occurrence still
+-- standing is ever a candidate. If it posts, later occurrences report id_already_exists,
+-- exactly as if it had been committed before the batch; if it fails, the next occurrence is
+-- evaluated on its own merits at its own position.
+--
+-- Remaining simplification: a concurrent insert of the same id is not caught here and fails
+-- the whole call on the primary key (whole-call errors still exist, as in TigerBeetle).
+CREATE OR REPLACE FUNCTION @extschema@.create_transfers(inputs @extschema@.transfer_input[])
+RETURNS TABLE (ord integer, transfer_id uuid, code text) AS $$
+#variable_conflict use_column
+DECLARE
+    invalid_ords  bigint[];
+    invalid_codes text[];
+    evicted_ords  bigint[] := '{}';
+    evicted_codes text[]   := '{}';
+    v_ord  bigint;
+    v_code text;
+BEGIN
+    IF inputs IS NULL OR cardinality(inputs) = 0 THEN
+        RETURN;
     END IF;
 
-    PERFORM id FROM @extschema@.accounts
-    WHERE id = ANY(ids)
-    ORDER BY id
+    -- Phases 1 and 2, once per call. Each CASE assigns the first failing check; the CASE
+    -- order is the documented precedence, and phase 2 only ever sees phase-1 survivors.
+    WITH p1_values AS (
+        -- Phase 1 — values: checks that need only the row itself. No table access. 1e39 is
+        -- the first value numeric(39,0) cannot hold, and NaN/Infinity land above it, so the
+        -- amount arm also catches those. debit = credit is NULL-safe: a NULL account id
+        -- falls through to phase 2's not-found checks.
+        SELECT t.ord, t.id, t.ledger_id, t.debit_account_id, t.credit_account_id,
+               CASE
+                   WHEN t.id IS NULL THEN 'id_not_set'
+                   WHEN t.amount IS NULL OR t.amount <= 0
+                        OR t.amount <> trunc(t.amount) OR t.amount >= 1e39
+                       THEN 'amount_must_be_positive'
+                   WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
+                   WHEN t.debit_account_id = t.credit_account_id
+                       THEN 'accounts_must_be_different'
+               END AS fail
+        FROM unnest(inputs) WITH ORDINALITY
+             AS t(id, ledger_id, debit_account_id, credit_account_id,
+                  amount, code, external_id, external_timestamp, ord)
+    ),
+    p2_relationships AS (
+        -- Phase 2 — relationships: everything that needs a lookup.
+        SELECT p.ord,
+               CASE
+                   WHEN EXISTS (SELECT FROM @extschema@.transfers tx WHERE tx.id = p.id)
+                       THEN 'id_already_exists'
+                   WHEN l.id  IS NULL THEN 'ledger_not_found'
+                   WHEN da.id IS NULL THEN 'debit_account_not_found'
+                   WHEN ca.id IS NULL THEN 'credit_account_not_found'
+                   WHEN da.ledger_id <> p.ledger_id THEN 'debit_account_ledger_mismatch'
+                   WHEN ca.ledger_id <> p.ledger_id THEN 'credit_account_ledger_mismatch'
+               END AS fail
+        FROM p1_values p
+        LEFT JOIN @extschema@.ledgers  l  ON l.id  = p.ledger_id
+        LEFT JOIN @extschema@.accounts da ON da.id = p.debit_account_id
+        LEFT JOIN @extschema@.accounts ca ON ca.id = p.credit_account_id
+        WHERE p.fail IS NULL
+    ),
+    fails AS (
+        SELECT f.ord, f.fail FROM p1_values f WHERE f.fail IS NOT NULL
+        UNION ALL
+        SELECT f.ord, f.fail FROM p2_relationships f WHERE f.fail IS NOT NULL
+    )
+    SELECT COALESCE(array_agg(f.ord  ORDER BY f.ord), '{}'),
+           COALESCE(array_agg(f.fail ORDER BY f.ord), '{}')
+      INTO invalid_ords, invalid_codes
+    FROM fails f;
+
+    -- Phase 3 — balance rules, the checks whose outcome changes as transfers process.
+    -- Lock every referenced account, in id order, so concurrent batches sharing accounts
+    -- cannot deadlock — same idiom as the old post_transfers(). This is a superset of the
+    -- accounts that will post (evicted and invalid rows' accounts too), which is harmless.
+    PERFORM a.id FROM @extschema@.accounts a
+    WHERE a.id IN (SELECT i.debit_account_id FROM unnest(inputs) i
+                   UNION
+                   SELECT i.credit_account_id FROM unnest(inputs) i)
+    ORDER BY a.id
     FOR NO KEY UPDATE;
 
-    WITH legs AS (
-        SELECT debit_account_id AS account_id, id AS transfer_id, created_at,
-               amount AS debit, 0::numeric AS credit
-        FROM new_transfers
-        UNION ALL
-        SELECT credit_account_id, id, created_at, 0, amount
-        FROM new_transfers
-    ),
-    -- Latest totals per touched account. LATERAL with LIMIT 1 walks the PK backwards; a
-    -- DISTINCT ON over the table would read the account's whole history.
-    prev AS (
-        SELECT a.id AS account_id, b.version, b.debits_posted, b.credits_posted
-        FROM unnest(ids) AS a(id)
-        LEFT JOIN LATERAL (
-            SELECT ab.version, ab.debits_posted, ab.credits_posted
-            FROM @extschema@.account_balances ab
-            WHERE ab.account_id = a.id
-            ORDER BY ab.version DESC
+    -- Opens the write path for the guard triggers; reset below keeps the window tight.
+    PERFORM set_config('pgledger.posting', 'on', true);
+
+    -- One statement, run at most k+1 times: it returns the earliest balance-rule violator,
+    -- and its INSERTs fire only on a clean pass (data-modifying CTEs always execute, so the
+    -- gating lives in their WHERE NOT EXISTS; every part shares one snapshot).
+    LOOP
+        WITH candidates AS (
+            -- Earliest surviving occurrence per id: a repeated id has one row in play at a
+            -- time. If that row is evicted, the next occurrence is promoted on the next
+            -- pass, at its own position; occurrences shut out by a posted winner get
+            -- id_already_exists in the results.
+            SELECT DISTINCT ON (t.id)
+                   t.ord, t.id, t.ledger_id, t.debit_account_id, t.credit_account_id,
+                   t.amount, t.code, t.external_id, t.external_timestamp
+            FROM unnest(inputs) WITH ORDINALITY
+                 AS t(id, ledger_id, debit_account_id, credit_account_id,
+                      amount, code, external_id, external_timestamp, ord)
+            WHERE NOT (t.ord = ANY(invalid_ords))
+              AND NOT (t.ord = ANY(evicted_ords))
+            ORDER BY t.id, t.ord
+        ),
+        -- side makes the violator deterministic when one transfer breaks a rule on both of
+        -- its accounts: the debit side is checked first, as TigerBeetle does.
+        legs AS (
+            SELECT c.debit_account_id AS account_id, c.id AS t_id, c.ord, 0 AS side,
+                   c.amount AS debit, 0::numeric AS credit
+            FROM candidates c
+            UNION ALL
+            SELECT c.credit_account_id, c.id, c.ord, 1, 0, c.amount
+            FROM candidates c
+        ),
+        -- Latest totals per touched account. LATERAL with LIMIT 1 walks the PK backwards; a
+        -- DISTINCT ON over the table would read the account's whole history.
+        prev AS (
+            SELECT acct.account_id, b.version, b.debits_posted, b.credits_posted
+            FROM (SELECT DISTINCT lg.account_id FROM legs lg) acct
+            LEFT JOIN LATERAL (
+                SELECT ab.version, ab.debits_posted, ab.credits_posted
+                FROM @extschema@.account_balances ab
+                WHERE ab.account_id = acct.account_id
+                ORDER BY ab.version DESC
+                LIMIT 1
+            ) b ON true
+        ),
+        running AS (
+            SELECT l.account_id, l.t_id, l.ord, l.side,
+                   COALESCE(p.version, 0)        + row_number()  OVER w AS version,
+                   COALESCE(p.debits_posted, 0)  + sum(l.debit)  OVER w AS debits_posted,
+                   COALESCE(p.credits_posted, 0) + sum(l.credit) OVER w AS credits_posted
+            FROM legs l
+            LEFT JOIN prev p USING (account_id)
+            WINDOW w AS (PARTITION BY l.account_id ORDER BY l.ord ROWS UNBOUNDED PRECEDING)
+        ),
+        violator AS (
+            SELECT r.ord,
+                   CASE WHEN a.require_credit_balance THEN 'exceeds_credits'
+                        ELSE 'exceeds_debits' END AS fail
+            FROM running r
+            JOIN @extschema@.accounts a ON a.id = r.account_id
+            WHERE (a.require_credit_balance AND r.debits_posted  > r.credits_posted)
+               OR (a.require_debit_balance  AND r.credits_posted > r.debits_posted)
+            ORDER BY r.ord, r.side
             LIMIT 1
-        ) b ON true
+        ),
+        ins_t AS (
+            INSERT INTO @extschema@.transfers
+                (id, ledger_id, debit_account_id, credit_account_id,
+                 amount, code, external_id, external_timestamp)
+            SELECT c.id, c.ledger_id, c.debit_account_id, c.credit_account_id,
+                   c.amount, c.code, c.external_id, c.external_timestamp
+            FROM candidates c
+            WHERE NOT EXISTS (SELECT FROM violator)
+            ORDER BY c.ord
+        ),
+        ins_b AS (
+            INSERT INTO @extschema@.account_balances
+                (account_id, version, transfer_id, debits_posted, credits_posted)
+            SELECT r.account_id, r.version, r.t_id, r.debits_posted, r.credits_posted
+            FROM running r
+            WHERE NOT EXISTS (SELECT FROM violator)
+        )
+        SELECT v.ord, v.fail INTO v_ord, v_code FROM violator v;
+
+        EXIT WHEN v_ord IS NULL;
+
+        evicted_ords  := evicted_ords  || v_ord;
+        evicted_codes := evicted_codes || v_code;
+    END LOOP;
+
+    PERFORM set_config('pgledger.posting', '', true);
+
+    RETURN QUERY
+    WITH coded AS (
+        SELECT t.ord, t.id, bad.fail
+        FROM unnest(inputs) WITH ORDINALITY
+             AS t(id, ledger_id, debit_account_id, credit_account_id,
+                  amount, code, external_id, external_timestamp, ord)
+        LEFT JOIN unnest(invalid_ords || evicted_ords,
+                         invalid_codes || evicted_codes) AS bad(o, fail) ON bad.o = t.ord
     ),
-    posted AS (
-        INSERT INTO @extschema@.account_balances
-            (account_id, version, transfer_id, debits_posted, credits_posted)
-        SELECT
-            l.account_id,
-            COALESCE(p.version, 0)        + row_number()  OVER w,
-            l.transfer_id,
-            COALESCE(p.debits_posted, 0)  + sum(l.debit)  OVER w,
-            COALESCE(p.credits_posted, 0) + sum(l.credit) OVER w
-        FROM legs l
-        LEFT JOIN prev p USING (account_id)
-        WINDOW w AS (PARTITION BY l.account_id ORDER BY l.created_at, l.transfer_id ROWS UNBOUNDED PRECEDING)
-        RETURNING account_id, transfer_id, debits_posted, credits_posted
+    -- Rows the loop ended with. Rank 1 per id is the occurrence the final pass inserted;
+    -- any later occurrence of the same id lost to a row that is now committed.
+    survivors AS (
+        SELECT c.ord, row_number() OVER (PARTITION BY c.id ORDER BY c.ord) AS rn
+        FROM coded c
+        WHERE c.fail IS NULL
     )
-    SELECT p.account_id, p.transfer_id, p.debits_posted, p.credits_posted,
-           a.require_credit_balance, a.require_debit_balance
-    INTO bad
-    FROM posted p
-    JOIN @extschema@.accounts a ON a.id = p.account_id
-    WHERE (a.require_credit_balance AND p.debits_posted > p.credits_posted)
-       OR (a.require_debit_balance  AND p.credits_posted > p.debits_posted)
-    LIMIT 1;
-
-    IF FOUND THEN
-        IF bad.require_credit_balance THEN
-            RAISE EXCEPTION 'account % is credit-normal: transfer % would put debits % past credits %',
-                bad.account_id, bad.transfer_id, bad.debits_posted, bad.credits_posted;
-        END IF;
-        RAISE EXCEPTION 'account % is debit-normal: transfer % would put credits % past debits %',
-            bad.account_id, bad.transfer_id, bad.credits_posted, bad.debits_posted;
-    END IF;
-
-    RETURN NULL;
+    SELECT c.ord::integer, c.id,
+           COALESCE(c.fail, CASE WHEN s.rn = 1 THEN 'ok' ELSE 'id_already_exists' END)
+    FROM coded c
+    LEFT JOIN survivors s ON s.ord = c.ord
+    ORDER BY c.ord;
 END;
 $$ LANGUAGE plpgsql
 -- The posting statement costs more to plan than to run, and the planner keeps re-planning it
--- because a custom plan for a two-element array always looks cheaper than the generic one.
--- Plan it once; every access path in it is an index lookup whatever the batch size.
+-- because a custom plan for a small array always looks cheaper than the generic one. Plan it
+-- once; every access path in it is an index lookup whatever the batch size.
 SET plan_cache_mode = force_generic_plan;
-
-CREATE TRIGGER transfers_post
-    AFTER INSERT ON @extschema@.transfers
-    REFERENCING NEW TABLE AS new_transfers
-    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.post_transfers();
 
 
 -- Every account's latest totals, zeros if never posted to. Upgrades can only append columns.

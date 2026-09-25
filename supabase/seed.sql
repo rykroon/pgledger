@@ -15,8 +15,10 @@ VALUES ('33333333-3333-3333-3333-333333333333',
         '11111111-1111-1111-1111-111111111111', 2, true);
 
 -- A sale: value flows credit -> debit, so cash is debited and revenue credited.
-INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount, code)
-VALUES ('44444444-4444-4444-4444-444444444444',
+-- Direct INSERTs into ledger.transfers are rejected; posting goes through create_transfers().
+SELECT * FROM ledger.create_transfers(ARRAY[
+    ROW('44444444-4444-4444-4444-444444444444',
         '11111111-1111-1111-1111-111111111111',
         '22222222-2222-2222-2222-222222222222',
-        '33333333-3333-3333-3333-333333333333', 100, 1);
+        '33333333-3333-3333-3333-333333333333', 100, 1, NULL, NULL)::ledger.transfer_input
+]);
