@@ -211,19 +211,19 @@ DECLARE
     --     throughout (ids can be NULL or repeated) and the first column of the result.
     --   * a "slot" is a small number, 1..n, given to each distinct account the batch
     --     touches, so the walk can keep account balances in plain arrays indexed by slot.
-    -- Arrays are named for one element — candidate_amount[k] is candidate k's amount.
+    -- Arrays are named for one element — candidate_ord[k] is candidate k's ord.
 
     -- Rows that failed phase 1 or 2, with the code of the check they failed.
     invalid_ord  bigint[];
     invalid_code text[];
 
     -- Candidates: rows that passed phases 1 and 2, in batch order, 1..candidate_count.
+    -- Only what the input doesn't already hold; the rest is read from inputs[ord].
     candidate_count       integer;
     candidate_ord         bigint[];
     candidate_id_group    integer[];   -- same number for rows sharing an id
     candidate_debit_slot  integer[];
     candidate_credit_slot integer[];
-    candidate_amount      numeric[];
 
     -- Per slot: the account and its running totals, advanced as the walk accepts rows.
     slot_account_id              uuid[];
@@ -239,32 +239,47 @@ DECLARE
     -- Walk output. Each group is preallocated to its maximum size, filled by subscript
     -- up to its count, and sliced to [1:count] at insert time. Growing arrays element by
     -- element costs about twice as much, and || would copy the whole array on every append.
+    -- Accepted rows are built as the tables' own row types, so the inserts are plain
+    -- unnests; fields are assigned by name, which keeps working if a column is appended.
     rejected_count integer := 0;
     rejected_ord   bigint[];
     rejected_code  text[];
 
-    accepted_count  integer := 0;
-    accepted_ord    bigint[];
-    accepted_amount numeric[];   -- from the walk, not the input: balancing will set it there
+    accepted_count     integer := 0;
+    accepted_transfers @extschema@.transfers[];
 
-    balance_row_count          integer := 0;   -- two per accepted transfer
-    balance_row_account_id     uuid[];
-    balance_row_version        bigint[];
-    balance_row_ord            bigint[];
-    balance_row_debits_posted  numeric[];
-    balance_row_credits_posted numeric[];
+    balance_row_count integer := 0;   -- two per accepted transfer
+    balance_rows      @extschema@.account_balances[];
 
     -- The row the walk is on.
     candidate_index            integer;
+    candidate                  @extschema@.transfer_input;
     debit_slot                 integer;
     credit_slot                integer;
     amount                     numeric;
     debit_account_new_debits   numeric;
     credit_account_new_credits numeric;
     rejection_code             text;
+    new_transfer               @extschema@.transfers;
+    new_balance_row            @extschema@.account_balances;
 BEGIN
     IF inputs IS NULL OR cardinality(inputs) = 0 THEN
         RETURN;
+    END IF;
+
+    -- A declared transfer_input[] still accepts any number of dimensions: Postgres ignores
+    -- array dimensions in type declarations. A batch is a list, so anything else is a
+    -- caller bug.
+    IF array_ndims(inputs) <> 1 THEN
+        RAISE EXCEPTION 'create_transfers expects a one-dimensional array, got % dimensions',
+            array_ndims(inputs);
+    END IF;
+
+    -- ord counts 1, 2, 3, … but the walk reads rows back as inputs[ord], which uses the
+    -- array's own indexes, and those can start anywhere ('[0:1]={...}' starts at 0).
+    -- Copy such an array into a fresh one, whose indexes always start at 1.
+    IF array_lower(inputs, 1) <> 1 THEN
+        inputs := ARRAY(SELECT unnest(inputs));
     END IF;
 
     -- Phases 1 and 2, and the lock-free part of the phase-3 setup, in one pass, before any
@@ -317,7 +332,7 @@ BEGIN
     -- Phase-3 setup: the candidates in batch order, and each distinct touched account as a
     -- numbered slot.
     candidates AS (
-        SELECT p.ord, p.id, p.debit_account_id, p.credit_account_id, p.amount,
+        SELECT p.ord, p.id, p.debit_account_id, p.credit_account_id,
                row_number() OVER (ORDER BY p.ord) AS candidate_index,
                dense_rank()  OVER (ORDER BY p.id) AS id_group
         FROM p1_values p
@@ -345,19 +360,18 @@ BEGIN
         JOIN @extschema@.accounts a ON a.id = sa.account_id
     )
     SELECT invalid_arrays.ords, invalid_arrays.codes,
-           candidate_arrays.ords, candidate_arrays.id_groups, candidate_arrays.amounts,
+           candidate_arrays.ords, candidate_arrays.id_groups,
            leg_arrays.debit_slots, leg_arrays.credit_slots,
            slot_arrays.account_ids, slot_arrays.requires_debit, slot_arrays.requires_credit
       INTO invalid_ord, invalid_code,
-           candidate_ord, candidate_id_group, candidate_amount,
+           candidate_ord, candidate_id_group,
            candidate_debit_slot, candidate_credit_slot,
            slot_account_id, slot_requires_debit_balance, slot_requires_credit_balance
     FROM (SELECT COALESCE(array_agg(f.ord  ORDER BY f.ord), '{}') AS ords,
                  COALESCE(array_agg(f.fail ORDER BY f.ord), '{}') AS codes
           FROM fails f) invalid_arrays,
          (SELECT COALESCE(array_agg(cn.ord           ORDER BY cn.candidate_index), '{}') AS ords,
-                 COALESCE(array_agg(cn.id_group::int ORDER BY cn.candidate_index), '{}') AS id_groups,
-                 COALESCE(array_agg(cn.amount        ORDER BY cn.candidate_index), '{}') AS amounts
+                 COALESCE(array_agg(cn.id_group::int ORDER BY cn.candidate_index), '{}') AS id_groups
           FROM candidates cn) candidate_arrays,
          (SELECT COALESCE(array_agg(lg.slot::int ORDER BY lg.candidate_index)
                               FILTER (WHERE lg.is_debit_leg), '{}') AS debit_slots,
@@ -399,16 +413,11 @@ BEGIN
         ) b ON true;
     END IF;
 
-    id_group_posted            := array_fill(false,        ARRAY[candidate_count]);
-    rejected_ord               := array_fill(NULL::bigint,  ARRAY[candidate_count]);
-    rejected_code              := array_fill(NULL::text,    ARRAY[candidate_count]);
-    accepted_ord               := array_fill(NULL::bigint,  ARRAY[candidate_count]);
-    accepted_amount            := array_fill(NULL::numeric, ARRAY[candidate_count]);
-    balance_row_account_id     := array_fill(NULL::uuid,    ARRAY[2 * candidate_count]);
-    balance_row_version        := array_fill(NULL::bigint,  ARRAY[2 * candidate_count]);
-    balance_row_ord            := array_fill(NULL::bigint,  ARRAY[2 * candidate_count]);
-    balance_row_debits_posted  := array_fill(NULL::numeric, ARRAY[2 * candidate_count]);
-    balance_row_credits_posted := array_fill(NULL::numeric, ARRAY[2 * candidate_count]);
+    id_group_posted            := array_fill(false,       ARRAY[candidate_count]);
+    rejected_ord               := array_fill(NULL::bigint, ARRAY[candidate_count]);
+    rejected_code              := array_fill(NULL::text,   ARRAY[candidate_count]);
+    accepted_transfers         := array_fill(NULL::@extschema@.transfers,        ARRAY[candidate_count]);
+    balance_rows               := array_fill(NULL::@extschema@.account_balances, ARRAY[2 * candidate_count]);
 
     -- Each step reads and writes plain array elements; a rejected row changes nothing, so
     -- later rows never see it.
@@ -421,10 +430,11 @@ BEGIN
             CONTINUE;
         END IF;
 
+        candidate   := inputs[candidate_ord[candidate_index]];
         debit_slot  := candidate_debit_slot[candidate_index];
         credit_slot := candidate_credit_slot[candidate_index];
         -- A balancing transfer would compute its amount here, from the slot balances.
-        amount      := candidate_amount[candidate_index];
+        amount      := candidate.amount;
 
         -- A transfer only adds debits to its debit account and credits to its credit
         -- account, so each side can only break one rule. Debit account first, as
@@ -456,61 +466,47 @@ BEGIN
         slot_version[credit_slot] := slot_version[credit_slot] + 1;
         id_group_posted[candidate_id_group[candidate_index]] := true;
 
+        -- created_at is never assigned, so it stays NULL for set_created_at to fill.
+        new_transfer.id                 := candidate.id;
+        new_transfer.ledger_id          := candidate.ledger_id;
+        new_transfer.debit_account_id   := candidate.debit_account_id;
+        new_transfer.credit_account_id  := candidate.credit_account_id;
+        new_transfer.amount             := amount;   -- the walk's amount, not the input's
+        new_transfer.code               := candidate.code;
+        new_transfer.external_id        := candidate.external_id;
+        new_transfer.external_timestamp := candidate.external_timestamp;
         accepted_count := accepted_count + 1;
-        accepted_ord[accepted_count]    := candidate_ord[candidate_index];
-        accepted_amount[accepted_count] := amount;
+        accepted_transfers[accepted_count] := new_transfer;
 
+        new_balance_row.transfer_id    := candidate.id;
+        new_balance_row.account_id     := slot_account_id[debit_slot];
+        new_balance_row.version        := slot_version[debit_slot];
+        new_balance_row.debits_posted  := slot_debits_posted[debit_slot];
+        new_balance_row.credits_posted := slot_credits_posted[debit_slot];
         balance_row_count := balance_row_count + 1;
-        balance_row_account_id[balance_row_count]     := slot_account_id[debit_slot];
-        balance_row_version[balance_row_count]        := slot_version[debit_slot];
-        balance_row_ord[balance_row_count]            := candidate_ord[candidate_index];
-        balance_row_debits_posted[balance_row_count]  := slot_debits_posted[debit_slot];
-        balance_row_credits_posted[balance_row_count] := slot_credits_posted[debit_slot];
+        balance_rows[balance_row_count] := new_balance_row;
 
+        new_balance_row.account_id     := slot_account_id[credit_slot];
+        new_balance_row.version        := slot_version[credit_slot];
+        new_balance_row.debits_posted  := slot_debits_posted[credit_slot];
+        new_balance_row.credits_posted := slot_credits_posted[credit_slot];
         balance_row_count := balance_row_count + 1;
-        balance_row_account_id[balance_row_count]     := slot_account_id[credit_slot];
-        balance_row_version[balance_row_count]        := slot_version[credit_slot];
-        balance_row_ord[balance_row_count]            := candidate_ord[candidate_index];
-        balance_row_debits_posted[balance_row_count]  := slot_debits_posted[credit_slot];
-        balance_row_credits_posted[balance_row_count] := slot_credits_posted[credit_slot];
+        balance_rows[balance_row_count] := new_balance_row;
     END LOOP;
 
     -- Opens the write path for the guard triggers; reset below keeps the window tight.
     PERFORM set_config('pgledger.posting', 'on', true);
 
-    -- One statement writes both tables and assembles the results. Rows are matched back to
-    -- their inputs by ord.
+    -- One statement writes both tables and assembles the results. The accepted rows are
+    -- already whole table rows, in batch order.
     RETURN QUERY
-    WITH accepted AS (
-        SELECT a.ord, a.amount
-        FROM unnest(accepted_ord[1:accepted_count], accepted_amount[1:accepted_count])
-             AS a(ord, amount)
-    ),
-    insert_transfers AS (
+    WITH insert_transfers AS (
         INSERT INTO @extschema@.transfers
-            (id, ledger_id, debit_account_id, credit_account_id,
-             amount, code, external_id, external_timestamp)
-        SELECT t.id, t.ledger_id, t.debit_account_id, t.credit_account_id,
-               a.amount, t.code, t.external_id, t.external_timestamp
-        FROM accepted a
-        JOIN unnest(inputs) WITH ORDINALITY
-             AS t(id, ledger_id, debit_account_id, credit_account_id,
-                  amount, code, external_id, external_timestamp, ord) ON t.ord = a.ord
-        ORDER BY a.ord
+        SELECT * FROM unnest(accepted_transfers[1:accepted_count])
     ),
     insert_balance_rows AS (
         INSERT INTO @extschema@.account_balances
-            (account_id, version, transfer_id, debits_posted, credits_posted)
-        SELECT b.account_id, b.version, t.id, b.debits_posted, b.credits_posted
-        FROM unnest(balance_row_account_id[1:balance_row_count],
-                    balance_row_version[1:balance_row_count],
-                    balance_row_ord[1:balance_row_count],
-                    balance_row_debits_posted[1:balance_row_count],
-                    balance_row_credits_posted[1:balance_row_count])
-             AS b(account_id, version, ord, debits_posted, credits_posted)
-        JOIN unnest(inputs) WITH ORDINALITY
-             AS t(id, ledger_id, debit_account_id, credit_account_id,
-                  amount, code, external_id, external_timestamp, ord) ON t.ord = b.ord
+        SELECT * FROM unnest(balance_rows[1:balance_row_count])
     )
     -- Every input row gets a result: its rejection code if it failed any phase, else 'ok'.
     SELECT t.ord::integer, t.id, COALESCE(rejection.code, 'ok')
