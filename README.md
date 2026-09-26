@@ -3,7 +3,8 @@
 A double-entry ledger for Postgres, inspired by [TigerBeetle](https://tigerbeetle.com/).
 
 Every transfer moves value from a credit account to a debit account, and both sides are
-recorded. Nothing is ever updated or deleted — ledgers, accounts, transfers, and balances are all append-only, so the full history stays readable.
+recorded. Nothing is ever deleted. Ledgers, transfers, and balance history are append-only; the
+only thing that changes is each account's running totals.
 
 ## Install
 
@@ -33,16 +34,17 @@ INSERT INTO ledger.ledgers (id) VALUES ('...ledger-id...');
 `ledger.ledgers` is intentionally bare. Keep mutable attributes such as a name in your own
 table keyed by `ledger_id uuid PRIMARY KEY REFERENCES ledger.ledgers(id)`.
 
-Create accounts. Each account may optionally restrict which side its balance can be on:
+Create accounts. Each account must say whether it keeps [history](#history), and may
+optionally restrict which side its balance can be on:
 
 ```sql
--- cash (code 1 in this example): debit-normal, cannot go below zero
-INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance)
-VALUES ('...cash-id...', '...ledger-id...', 1, true);
+-- cash (code 1 in this example): debit-normal, cannot go below zero, keeps history
+INSERT INTO ledger.accounts (id, ledger_id, code, history, require_debit_balance)
+VALUES ('...cash-id...', '...ledger-id...', 1, true, true);
 
--- revenue (code 2): credit-normal, cannot go below zero
-INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
-VALUES ('...revenue-id...', '...ledger-id...', 2, true);
+-- revenue (code 2): credit-normal, cannot go below zero, totals only
+INSERT INTO ledger.accounts (id, ledger_id, code, history, require_credit_balance)
+VALUES ('...revenue-id...', '...ledger-id...', 2, false, true);
 ```
 
 Post a transfer. Value flows credit -> debit, so recording a sale debits cash and credits
@@ -53,8 +55,9 @@ INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id
 VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id...', 100, 1);
 ```
 
-A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
-and enforces the balance rules. A multi-row `INSERT` posts every row, and a failure anywhere
+A trigger posts the transfer, updates both accounts' `debits_posted` and `credits_posted`,
+appends the new running totals to `ledger.account_balances` for accounts with history, and
+enforces the balance rules. A multi-row `INSERT` posts every row, and a failure anywhere
 rolls back the whole statement. A batch may span ledgers. Rows post in `created_at` order,
 which in practice is the order the statement produced them, but Postgres doesn't guarantee
 that order, so don't rely on it.
@@ -77,9 +80,14 @@ SELECT account_id, balance FROM ledger.current_balances WHERE ledger_id = '...le
 accounts read negative. Every transfer adds the same amount to both sides, so a ledger always
 sums to zero.
 
-For history, `ledger.account_balances` has one row per account per transfer, holding the
-running `debits_posted` and `credits_posted` after that transfer. `version` counts each
-account's postings from 1 and is their order; join `ledger.transfers` for timestamps:
+`ledger.accounts` carries the same totals in `debits_posted` and `credits_posted`.
+
+## History
+
+`history` is chosen when an account is created and can't change. For an account with
+history, `ledger.account_balances` has one row per transfer posted to it, holding the running
+`debits_posted` and `credits_posted` after that transfer. `version` counts the account's
+postings from 1 and is their order; join `ledger.transfers` for timestamps:
 
 ```sql
 SELECT ab.version, ab.debits_posted - ab.credits_posted AS balance, t.created_at
@@ -88,6 +96,10 @@ JOIN ledger.transfers t ON t.id = ab.transfer_id
 WHERE ab.account_id = '...cash-id...'
 ORDER BY ab.version;
 ```
+
+An account without history keeps only its current totals. It costs less to post to, and its
+past balances can still be rebuilt from `ledger.transfers`, but without a `version` to order
+them by. `current_balances.version` is `NULL` for such accounts.
 
 ## Balance rules
 
@@ -121,9 +133,7 @@ VALUES ('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id..
 COMMIT;
 ```
 
-Lock `ledger.accounts` rows, which is what posting waits on. Locking `ledger.account_balances`
-rows doesn't block other postings, and an account that has never been posted to has no
-balance rows to lock. Lock both accounts, not just the one being drained: taking one first
+Lock `ledger.accounts` rows, which is what posting waits on. Lock both accounts, not just the one being drained: taking one first
 and the other when the transfer posts can deadlock with a concurrent posting.
 
 Use `READ COMMITTED`. Under `REPEATABLE READ` or `SERIALIZABLE` the balance you read can be
@@ -146,8 +156,8 @@ them but never interprets them:
   the row was inserted. Rows get their own times, even within one statement, but it is not
   unique: two rows can share a microsecond.
 
-Transfers have no total order. Within one account, `ledger.account_balances.version` is the
-order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
+Transfers have no total order. Within an account with history,
+`ledger.account_balances.version` is the order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
 for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `created_at` is
 taken while posting holds the account locks, so within one account it follows `version`, but
 across accounts it can disagree with the order transactions commit in.
@@ -189,8 +199,10 @@ transaction already holds and never acquires one out of order. This is the same 
 - `created_at` is assigned by the ledger; supplying it is rejected.
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
-- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected, and so is
-  inserting into `ledger.account_balances` directly.
+- An account's `debits_posted` and `credits_posted` start at 0 and only grow; posting is the
+  only way to change them.
+- Any other `UPDATE`, and any `DELETE` or `TRUNCATE`, on the ledger tables is rejected, and so
+  is inserting into `ledger.account_balances` directly.
 
 ## Benchmark
 

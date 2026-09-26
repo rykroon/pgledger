@@ -28,22 +28,23 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 type config struct {
 	// workload
-	clients     int
-	ledgers     int
-	accounts    int
-	transfers   int
-	batch       int
-	ledgerSkew  float64
-	hotRatio    float64
-	hotAccounts int
-	rules       bool
-	fund        int64
-	amountMax   int64
-	uuidVersion string
-	warmup      int
-	seed        int64
-	verify      bool
-	jsonOut     bool
+	clients      int
+	ledgers      int
+	accounts     int
+	transfers    int
+	batch        int
+	ledgerSkew   float64
+	hotRatio     float64
+	hotAccounts  int
+	rules        bool
+	historyRatio float64
+	fund         int64
+	amountMax    int64
+	uuidVersion  string
+	warmup       int
+	seed         int64
+	verify       bool
+	jsonOut      bool
 
 	// container / install
 	image         string
@@ -68,6 +69,7 @@ func parseFlags() (*config, error) {
 	flag.Float64Var(&c.hotRatio, "hot-ratio", 0, "fraction of transfers with one side on a hot account of its ledger")
 	flag.IntVar(&c.hotAccounts, "hot-accounts", 1, "hot accounts per ledger")
 	flag.BoolVar(&c.rules, "rules", false, "accounts require a debit balance and are funded from an unrestricted reserve per ledger")
+	flag.Float64Var(&c.historyRatio, "history-ratio", 1, "fraction of each ledger's accounts that keep history, spread evenly")
 	flag.Int64Var(&c.fund, "fund", 1000000, "initial funding per account when -rules is set")
 	flag.Int64Var(&c.amountMax, "amount-max", 100, "transfer amounts are uniform in 1..amount-max")
 	flag.StringVar(&c.uuidVersion, "uuid", "v7", "id generation: v4 (random) or v7 (time-ordered)")
@@ -98,6 +100,9 @@ func parseFlags() (*config, error) {
 	}
 	if c.hotRatio < 0 || c.hotRatio > 1 || c.ledgerSkew < 0 {
 		return nil, errors.New("hot-ratio must be in [0,1] and ledger-skew >= 0")
+	}
+	if c.historyRatio < 0 || c.historyRatio > 1 {
+		return nil, errors.New("history-ratio must be in [0,1]")
 	}
 	perLedger := c.accounts / c.ledgers
 	if c.hotRatio > 0 && (c.hotAccounts < 1 || perLedger < c.hotAccounts+1) {

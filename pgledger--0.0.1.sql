@@ -23,15 +23,51 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- Only create_transfers() may write: it sets pgledger.posting around its inserts.
-CREATE OR REPLACE FUNCTION @extschema@.raise_direct_insert()
+-- Only create_transfers() may write: it sets pgledger.posting around its writes.
+CREATE OR REPLACE FUNCTION @extschema@.raise_direct_write()
 RETURNS TRIGGER AS $$
 BEGIN
     IF current_setting('pgledger.posting', true) IS DISTINCT FROM 'on' THEN
-        RAISE EXCEPTION '%.% is written by %.create_transfers(); INSERTing into it directly is not allowed',
-            TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_TABLE_SCHEMA;
+        RAISE EXCEPTION '%.% is written by %.create_transfers(); % on it directly is not allowed',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_TABLE_SCHEMA, TG_OP;
     END IF;
     RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Accounts start with no totals; only postings may add to them.
+CREATE OR REPLACE FUNCTION @extschema@.check_account_insert()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.debits_posted <> 0 OR NEW.credits_posted <> 0 THEN
+        RAISE EXCEPTION '%.%: debits_posted and credits_posted start at 0 and cannot be supplied',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Posting may only raise the running totals; everything else about an account is fixed.
+CREATE OR REPLACE FUNCTION @extschema@.check_account_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (NEW.id, NEW.created_at, NEW.ledger_id, NEW.code, NEW.external_id, NEW.external_timestamp,
+        NEW.require_credit_balance, NEW.require_debit_balance, NEW.history)
+       IS DISTINCT FROM
+       (OLD.id, OLD.created_at, OLD.ledger_id, OLD.code, OLD.external_id, OLD.external_timestamp,
+        OLD.require_credit_balance, OLD.require_debit_balance, OLD.history) THEN
+        RAISE EXCEPTION '%.%: only debits_posted and credits_posted can change',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    END IF;
+
+    IF NEW.debits_posted < OLD.debits_posted OR NEW.credits_posted < OLD.credits_posted THEN
+        RAISE EXCEPTION '%.%: debits_posted and credits_posted can only increase',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    END IF;
+
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -53,7 +89,9 @@ CREATE TRIGGER ledgers_immutable
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
 -- code, external_id and external_timestamp are opaque caller data. Both balance requirements
--- at once would pin the balance to zero.
+-- at once would pin the balance to zero. debits_posted and credits_posted are the current
+-- totals, the only mutable columns, written by create_transfers(). history chooses whether each
+-- posting also appends a row to account_balances.
 CREATE TABLE @extschema@.accounts (
     id                 uuid        PRIMARY KEY,
     created_at         timestamptz NOT NULL,
@@ -64,6 +102,11 @@ CREATE TABLE @extschema@.accounts (
 
     require_credit_balance boolean NOT NULL DEFAULT false,
     require_debit_balance  boolean NOT NULL DEFAULT false,
+
+    history boolean NOT NULL,
+
+    debits_posted  numeric(39,0) NOT NULL DEFAULT 0 CHECK (debits_posted >= 0),
+    credits_posted numeric(39,0) NOT NULL DEFAULT 0 CHECK (credits_posted >= 0),
 
     CONSTRAINT accounts_one_balance_requirement
         CHECK (NOT (require_credit_balance AND require_debit_balance)),
@@ -84,8 +127,20 @@ CREATE TRIGGER accounts_set_created_at
     BEFORE INSERT ON @extschema@.accounts
     FOR EACH ROW EXECUTE FUNCTION @extschema@.set_created_at();
 
+CREATE TRIGGER accounts_check_insert
+    BEFORE INSERT ON @extschema@.accounts
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.check_account_insert();
+
+CREATE TRIGGER accounts_no_direct_update
+    BEFORE UPDATE ON @extschema@.accounts
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_write();
+
+CREATE TRIGGER accounts_check_update
+    BEFORE UPDATE ON @extschema@.accounts
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.check_account_update();
+
 CREATE TRIGGER accounts_immutable
-    BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.accounts
+    BEFORE DELETE OR TRUNCATE ON @extschema@.accounts
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
 -- Value flows credit -> debit. create_transfers() validates accounts and ledgers itself; the
@@ -116,13 +171,13 @@ CREATE INDEX transfers_external_timestamp_idx ON @extschema@.transfers (external
 
 CREATE TRIGGER transfers_no_direct_insert
     BEFORE INSERT ON @extschema@.transfers
-    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_write();
 
 CREATE TRIGGER transfers_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.transfers
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- Running totals per account, two rows per transfer. version is gapless; a writer on a stale
+-- Running totals of history accounts, one row per leg posted to one. version is gapless; a writer on a stale
 -- snapshot fails on the primary key instead of forking the chain.
 CREATE TABLE @extschema@.account_balances (
     account_id     uuid          NOT NULL REFERENCES @extschema@.accounts(id),
@@ -137,7 +192,7 @@ CREATE TABLE @extschema@.account_balances (
 
 CREATE TRIGGER account_balances_no_direct_insert
     BEFORE INSERT ON @extschema@.account_balances
-    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_write();
 
 CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.account_balances
@@ -193,6 +248,7 @@ DECLARE
     slot_version                 bigint[];
     slot_requires_debit_balance  boolean[];
     slot_requires_credit_balance boolean[];
+    slot_history                 boolean[];
 
     id_group_posted boolean[];
 
@@ -205,7 +261,7 @@ DECLARE
     accepted_count     integer := 0;
     accepted_transfers @extschema@.transfers[];
 
-    balance_row_count integer := 0;   -- two per accepted transfer
+    balance_row_count integer := 0;   -- one per accepted leg on a history account
     balance_rows      @extschema@.account_balances[];
 
     candidate_index            integer;
@@ -296,20 +352,23 @@ BEGIN
               SELECT cn.candidate_index, false, cn.credit_account_id
               FROM candidates cn) l
     ),
-    -- Safe to read before the lock: accounts is immutable.
+    -- Safe to read before the lock: only an account's totals can change.
     slots AS (
-        SELECT sa.slot, sa.account_id, a.require_debit_balance, a.require_credit_balance
+        SELECT sa.slot, sa.account_id, a.require_debit_balance, a.require_credit_balance,
+               a.history
         FROM (SELECT DISTINCT lg.slot, lg.account_id FROM legs lg) sa
         JOIN @extschema@.accounts a ON a.id = sa.account_id
     )
     SELECT invalid_arrays.ords, invalid_arrays.codes,
            candidate_arrays.ords, candidate_arrays.id_groups,
            leg_arrays.debit_slots, leg_arrays.credit_slots,
-           slot_arrays.account_ids, slot_arrays.requires_debit, slot_arrays.requires_credit
+           slot_arrays.account_ids, slot_arrays.requires_debit, slot_arrays.requires_credit,
+           slot_arrays.history
       INTO invalid_ord, invalid_code,
            candidate_ord, candidate_id_group,
            candidate_debit_slot, candidate_credit_slot,
-           slot_account_id, slot_requires_debit_balance, slot_requires_credit_balance
+           slot_account_id, slot_requires_debit_balance, slot_requires_credit_balance,
+           slot_history
     FROM (SELECT COALESCE(array_agg(f.ord  ORDER BY f.ord), '{}') AS ords,
                  COALESCE(array_agg(f.fail ORDER BY f.ord), '{}') AS codes
           FROM fails f) invalid_arrays,
@@ -323,7 +382,8 @@ BEGIN
           FROM legs lg) leg_arrays,
          (SELECT COALESCE(array_agg(sl.account_id             ORDER BY sl.slot), '{}') AS account_ids,
                  COALESCE(array_agg(sl.require_debit_balance  ORDER BY sl.slot), '{}') AS requires_debit,
-                 COALESCE(array_agg(sl.require_credit_balance ORDER BY sl.slot), '{}') AS requires_credit
+                 COALESCE(array_agg(sl.require_credit_balance ORDER BY sl.slot), '{}') AS requires_credit,
+                 COALESCE(array_agg(sl.history                ORDER BY sl.slot), '{}') AS history
           FROM slots sl) slot_arrays;
 
     -- Phase 3: balance rules.
@@ -337,16 +397,18 @@ BEGIN
         ORDER BY a.id
         FOR NO KEY UPDATE;
 
-        -- Separate statement so its snapshot postdates the lock.
-        SELECT array_agg(COALESCE(b.debits_posted,  0) ORDER BY s.slot),
-               array_agg(COALESCE(b.credits_posted, 0) ORDER BY s.slot),
-               array_agg(COALESCE(b.version,        0) ORDER BY s.slot)
+        -- Separate statement so its snapshot postdates the lock. Only history accounts have
+        -- a version.
+        SELECT array_agg(a.debits_posted          ORDER BY s.slot),
+               array_agg(a.credits_posted         ORDER BY s.slot),
+               array_agg(COALESCE(b.version, 0)   ORDER BY s.slot)
           INTO slot_debits_posted, slot_credits_posted, slot_version
         FROM unnest(slot_account_id) WITH ORDINALITY AS s(account_id, slot)
+        JOIN @extschema@.accounts a ON a.id = s.account_id
         LEFT JOIN LATERAL (
-            SELECT ab.version, ab.debits_posted, ab.credits_posted
+            SELECT ab.version
             FROM @extschema@.account_balances ab
-            WHERE ab.account_id = s.account_id
+            WHERE a.history AND ab.account_id = s.account_id
             ORDER BY ab.version DESC
             LIMIT 1
         ) b ON true;
@@ -413,20 +475,25 @@ BEGIN
         accepted_count := accepted_count + 1;
         accepted_transfers[accepted_count] := new_transfer;
 
-        new_balance_row.transfer_id    := candidate.id;
-        new_balance_row.account_id     := slot_account_id[debit_slot];
-        new_balance_row.version        := slot_version[debit_slot];
-        new_balance_row.debits_posted  := slot_debits_posted[debit_slot];
-        new_balance_row.credits_posted := slot_credits_posted[debit_slot];
-        balance_row_count := balance_row_count + 1;
-        balance_rows[balance_row_count] := new_balance_row;
+        new_balance_row.transfer_id := candidate.id;
 
-        new_balance_row.account_id     := slot_account_id[credit_slot];
-        new_balance_row.version        := slot_version[credit_slot];
-        new_balance_row.debits_posted  := slot_debits_posted[credit_slot];
-        new_balance_row.credits_posted := slot_credits_posted[credit_slot];
-        balance_row_count := balance_row_count + 1;
-        balance_rows[balance_row_count] := new_balance_row;
+        IF slot_history[debit_slot] THEN
+            new_balance_row.account_id     := slot_account_id[debit_slot];
+            new_balance_row.version        := slot_version[debit_slot];
+            new_balance_row.debits_posted  := slot_debits_posted[debit_slot];
+            new_balance_row.credits_posted := slot_credits_posted[debit_slot];
+            balance_row_count := balance_row_count + 1;
+            balance_rows[balance_row_count] := new_balance_row;
+        END IF;
+
+        IF slot_history[credit_slot] THEN
+            new_balance_row.account_id     := slot_account_id[credit_slot];
+            new_balance_row.version        := slot_version[credit_slot];
+            new_balance_row.debits_posted  := slot_debits_posted[credit_slot];
+            new_balance_row.credits_posted := slot_credits_posted[credit_slot];
+            balance_row_count := balance_row_count + 1;
+            balance_rows[balance_row_count] := new_balance_row;
+        END IF;
     END LOOP;
 
     -- Opens the write path for the guard triggers.
@@ -440,6 +507,15 @@ BEGIN
     insert_balance_rows AS (
         INSERT INTO @extschema@.account_balances
         SELECT * FROM unnest(balance_rows[1:balance_row_count])
+    ),
+    -- Skips slots whose transfers were all rejected, so they leave no dead tuple.
+    update_accounts AS (
+        UPDATE @extschema@.accounts a
+        SET debits_posted = s.debits_posted, credits_posted = s.credits_posted
+        FROM unnest(slot_account_id, slot_debits_posted, slot_credits_posted)
+             AS s(account_id, debits_posted, credits_posted)
+        WHERE a.id = s.account_id
+          AND (a.debits_posted, a.credits_posted) IS DISTINCT FROM (s.debits_posted, s.credits_posted)
     )
     SELECT t.ord::integer, t.id, COALESCE(rejection.code, 'ok')
     FROM unnest(inputs) WITH ORDINALITY
@@ -458,20 +534,21 @@ $$ LANGUAGE plpgsql
 SET plan_cache_mode = force_generic_plan;
 
 
--- Every account's latest totals, zeros if never posted to. Upgrades can only append columns.
+-- Every account's current totals. version is NULL for accounts without history, 0 for history
+-- accounts never posted to. Upgrades can only append columns.
 CREATE VIEW @extschema@.current_balances AS
 SELECT
-    a.id        AS account_id,
+    a.id AS account_id,
     a.ledger_id,
-    COALESCE(b.version,        0) AS version,
-    COALESCE(b.debits_posted,  0) AS debits_posted,
-    COALESCE(b.credits_posted, 0) AS credits_posted,
-    COALESCE(b.debits_posted,  0) - COALESCE(b.credits_posted, 0) AS balance
+    CASE WHEN a.history THEN COALESCE(b.version, 0) END AS version,
+    a.debits_posted,
+    a.credits_posted,
+    a.debits_posted - a.credits_posted AS balance
 FROM @extschema@.accounts a
 LEFT JOIN LATERAL (
-    SELECT ab.version, ab.debits_posted, ab.credits_posted
+    SELECT ab.version
     FROM @extschema@.account_balances ab
-    WHERE ab.account_id = a.id
+    WHERE a.history AND ab.account_id = a.id
     ORDER BY ab.version DESC
     LIMIT 1
 ) b ON true;

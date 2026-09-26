@@ -145,8 +145,9 @@ type check struct {
 }
 
 // verify checks the invariants the trigger design promises: every ledger sums to zero, one
-// transfer row and two balance rows per posted transfer, gapless per-account versions, and no
-// deadlocks from single-statement posting.
+// transfer row per posted transfer and one balance row per leg on a history account, account
+// totals that match the transfers, gapless per-account versions, and no deadlocks from
+// single-statement posting.
 func verify(ctx context.Context, conn *pgx.Conn, schema string, rep *report) error {
 	q := func(rel string) string { return pgx.Identifier{schema, rel}.Sanitize() }
 	count := func(sql string) (int64, error) {
@@ -175,7 +176,22 @@ func verify(ctx context.Context, conn *pgx.Conn, schema string, rep *report) err
 	if err != nil {
 		return err
 	}
-	add("two balance rows per transfer", n == 2*rep.postedTotal, fmt.Sprintf("%d rows, %d expected", n, 2*rep.postedTotal))
+	wantBalanceRows, err := count(`SELECT count(*) FROM ` + q("transfers") + ` t
+JOIN ` + q("accounts") + ` a ON a.id IN (t.debit_account_id, t.credit_account_id)
+WHERE a.history`)
+	if err != nil {
+		return err
+	}
+	add("balance rows match history", n == wantBalanceRows, fmt.Sprintf("%d rows, %d expected", n, wantBalanceRows))
+
+	n, err = count(`SELECT count(*) FROM ` + q("accounts") + ` a
+LEFT JOIN (SELECT debit_account_id AS id, sum(amount) AS s FROM ` + q("transfers") + ` GROUP BY 1) d ON d.id = a.id
+LEFT JOIN (SELECT credit_account_id AS id, sum(amount) AS s FROM ` + q("transfers") + ` GROUP BY 1) c ON c.id = a.id
+WHERE a.debits_posted <> COALESCE(d.s, 0) OR a.credits_posted <> COALESCE(c.s, 0)`)
+	if err != nil {
+		return err
+	}
+	add("account totals match transfers", n == 0, fmt.Sprintf("%d accounts off", n))
 
 	n, err = count("SELECT count(*) FROM (SELECT account_id FROM " + q("account_balances") + " GROUP BY 1 HAVING max(version) <> count(*)) x")
 	if err != nil {
