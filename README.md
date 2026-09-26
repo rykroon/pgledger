@@ -149,8 +149,8 @@ them but never interprets them:
 Transfers have no total order. Within one account, `ledger.account_balances.version` is the
 order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
 for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `created_at` is
-taken before posting locks the accounts, so across transactions it can disagree with the
-order transfers were actually posted in.
+taken while posting holds the account locks, so within one account it follows `version`, but
+across accounts it can disagree with the order transactions commit in.
 
 ## Concurrency
 

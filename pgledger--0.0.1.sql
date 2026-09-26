@@ -9,7 +9,7 @@ $$ LANGUAGE plpgsql;
 
 
 -- Stamps created_at; callers can't supply it. clock_timestamp() gives each row its own time,
--- though not a unique one.
+-- though not a unique one. Transfers are stamped by create_transfers() instead.
 CREATE OR REPLACE FUNCTION @extschema@.set_created_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -89,7 +89,7 @@ CREATE TRIGGER accounts_immutable
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
 -- Value flows credit -> debit. create_transfers() validates accounts and ledgers itself; the
--- CHECKs are backstops.
+-- CHECKs are backstops. It also stamps created_at.
 CREATE TABLE @extschema@.transfers (
     id                 uuid          PRIMARY KEY,
     created_at         timestamptz   NOT NULL,
@@ -117,10 +117,6 @@ CREATE INDEX transfers_external_timestamp_idx ON @extschema@.transfers (external
 CREATE TRIGGER transfers_no_direct_insert
     BEFORE INSERT ON @extschema@.transfers
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
-
-CREATE TRIGGER transfers_set_created_at
-    BEFORE INSERT ON @extschema@.transfers
-    FOR EACH ROW EXECUTE FUNCTION @extschema@.set_created_at();
 
 CREATE TRIGGER transfers_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.transfers
@@ -405,8 +401,8 @@ BEGIN
         slot_version[credit_slot] := slot_version[credit_slot] + 1;
         id_group_posted[candidate_id_group[candidate_index]] := true;
 
-        -- created_at is never assigned, so it stays NULL for set_created_at to fill.
         new_transfer.id                 := candidate.id;
+        new_transfer.created_at         := clock_timestamp();
         new_transfer.ledger_id          := candidate.ledger_id;
         new_transfer.debit_account_id   := candidate.debit_account_id;
         new_transfer.credit_account_id  := candidate.credit_account_id;
