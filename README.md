@@ -189,8 +189,11 @@ transaction already holds and never acquires one out of order. This is the same 
 - `created_at` is assigned by the ledger; supplying it is rejected.
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
-- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected, and so is
-  inserting into `ledger.account_balances` directly.
+- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected.
+- Only `ledger.create_transfers()` writes `ledger.transfers` and `ledger.account_balances`.
+  It runs as the extension's owner (`SECURITY DEFINER`); any other role that inserts
+  directly is rejected, even if it has been granted `INSERT`. Grant your app roles
+  `EXECUTE` on the function, not `INSERT` on the tables.
 
 ## Benchmark
 
