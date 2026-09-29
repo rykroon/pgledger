@@ -128,9 +128,9 @@ CREATE TRIGGER transfers_immutable
 -- Running totals per account, two rows per transfer. version is gapless; a writer on a stale
 -- snapshot fails on the primary key instead of forking the chain.
 CREATE TABLE @extschema@.account_balances (
-    account_id     uuid          NOT NULL REFERENCES @extschema@.accounts(id),
+    account_id     uuid          NOT NULL,
     version        bigint        NOT NULL CHECK (version > 0),
-    transfer_id    uuid          NOT NULL REFERENCES @extschema@.transfers(id),
+    transfer_id    uuid          NOT NULL,
     debits_posted  numeric(39,0) NOT NULL CHECK (debits_posted >= 0),
     credits_posted numeric(39,0) NOT NULL CHECK (credits_posted >= 0),
 

@@ -146,7 +146,9 @@ type check struct {
 
 // verify checks the invariants the trigger design promises: every ledger sums to zero, one
 // transfer row and two balance rows per posted transfer, gapless per-account versions, and no
-// deadlocks from single-statement posting.
+// deadlocks from single-statement posting. account_balances has no foreign keys, so it also
+// checks what they would have: every balance row points at a real account and transfer, and
+// every transfer has a row for each of its two accounts.
 func verify(ctx context.Context, conn *pgx.Conn, schema string, rep *report) error {
 	q := func(rel string) string { return pgx.Identifier{schema, rel}.Sanitize() }
 	count := func(sql string) (int64, error) {
@@ -176,6 +178,28 @@ func verify(ctx context.Context, conn *pgx.Conn, schema string, rep *report) err
 		return err
 	}
 	add("two balance rows per transfer", n == 2*rep.postedTotal, fmt.Sprintf("%d rows, %d expected", n, 2*rep.postedTotal))
+
+	n, err = count("SELECT count(*) FROM " + q("account_balances") + " ab WHERE NOT EXISTS (SELECT FROM " + q("accounts") + " a WHERE a.id = ab.account_id)")
+	if err != nil {
+		return err
+	}
+	add("balance rows reference accounts", n == 0, fmt.Sprintf("%d orphaned", n))
+
+	n, err = count("SELECT count(*) FROM " + q("account_balances") + " ab WHERE NOT EXISTS (SELECT FROM " + q("transfers") + " t WHERE t.id = ab.transfer_id)")
+	if err != nil {
+		return err
+	}
+	add("balance rows reference transfers", n == 0, fmt.Sprintf("%d orphaned", n))
+
+	// With the row count above and UNIQUE (transfer_id, account_id), this means exactly the
+	// transfer's two accounts.
+	n, err = count("SELECT count(*) FROM " + q("transfers") + " t" +
+		" WHERE NOT EXISTS (SELECT FROM " + q("account_balances") + " ab WHERE ab.transfer_id = t.id AND ab.account_id = t.debit_account_id)" +
+		" OR NOT EXISTS (SELECT FROM " + q("account_balances") + " ab WHERE ab.transfer_id = t.id AND ab.account_id = t.credit_account_id)")
+	if err != nil {
+		return err
+	}
+	add("balance rows match transfer accounts", n == 0, fmt.Sprintf("%d transfers missing a leg", n))
 
 	n, err = count("SELECT count(*) FROM (SELECT account_id FROM " + q("account_balances") + " GROUP BY 1 HAVING max(version) <> count(*)) x")
 	if err != nil {
