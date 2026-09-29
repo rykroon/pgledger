@@ -133,8 +133,12 @@ SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::bool[])`
 	close(jobs)
 	err = parallel(ctx, len(conns), func(ctx context.Context, i int) error {
 		for batch := range jobs {
-			if err := postBatch(ctx, conns[i], sql, batch, runID); err != nil {
+			rejected, err := postBatch(ctx, conns[i], sql, batch, runID)
+			if err != nil {
 				return fmt.Errorf("fund accounts: %w", err)
+			}
+			if rejected > 0 {
+				return fmt.Errorf("fund accounts: %d rows rejected", rejected)
 			}
 		}
 		return nil

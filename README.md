@@ -149,8 +149,8 @@ them but never interprets them:
 Transfers have no total order. Within one account, `ledger.account_balances.version` is the
 order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
 for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `created_at` is
-taken before posting locks the accounts, so across transactions it can disagree with the
-order transfers were actually posted in.
+taken while posting holds the account locks, so within one account it follows `version`, but
+across accounts it can disagree with the order transactions commit in.
 
 ## Concurrency
 
@@ -189,8 +189,11 @@ transaction already holds and never acquires one out of order. This is the same 
 - `created_at` is assigned by the ledger; supplying it is rejected.
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
-- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected, and so is
-  inserting into `ledger.account_balances` directly.
+- Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected.
+- Only `ledger.create_transfers()` writes `ledger.transfers` and `ledger.account_balances`.
+  It runs as the extension's owner (`SECURITY DEFINER`); any other role that inserts
+  directly is rejected, even if it has been granted `INSERT`. Grant your app roles
+  `EXECUTE` on the function, not `INSERT` on the tables.
 
 ## Benchmark
 
