@@ -165,12 +165,12 @@ CREATE TYPE @extschema@.transfer_input AS (
 
 -- One row of create_transfers()'s result, in input order. code is 'ok' or the first failed
 -- check:
---   1 values:        id_not_set, amount_must_be_positive, code_invalid,
---                    accounts_must_be_different
---   2 relationships: id_already_exists, ledger_not_found, debit_account_not_found,
---                    credit_account_not_found, debit_account_ledger_mismatch,
---                    credit_account_ledger_mismatch
---   3 balances:      exceeds_credits, exceeds_debits
+--   values:        id_not_set, amount_must_be_positive, code_invalid,
+--                  accounts_must_be_different
+--   relationships: id_already_exists, ledger_not_found, debit_account_not_found,
+--                  credit_account_not_found, debit_account_ledger_mismatch,
+--                  credit_account_ledger_mismatch
+--   balances:      exceeds_credits, exceeds_debits
 CREATE TYPE @extschema@.transfer_result AS (
     ord         integer,
     transfer_id uuid,
@@ -178,7 +178,7 @@ CREATE TYPE @extschema@.transfer_result AS (
 );
 
 -- Posts a batch TigerBeetle-style: each row gets its own result and a rejected row doesn't
--- abort the others. Phase 3 is one linear walk over in-memory balances in batch order, so a
+-- abort the others. Phase 2 is one linear walk over in-memory balances in batch order, so a
 -- rejected row never affects later ones. A repeated id posts at most once; later copies get
 -- id_already_exists. A concurrent insert of the same id fails the whole call on the primary key.
 CREATE OR REPLACE FUNCTION @extschema@.create_transfers(inputs @extschema@.transfer_input[])
@@ -187,11 +187,11 @@ DECLARE
     -- ord: a row's 1-based position in inputs, its identity throughout (ids can repeat).
     -- rank: 1..n per distinct account touched; account state lives in arrays indexed by rank.
 
-    -- One per input, indexed by ord. Phases 1 and 2 fill in every code; candidates start as
+    -- One per input, indexed by ord. Phase 1 fills in every code; candidates start as
     -- 'ok' and the walk overwrites the ones it rejects.
     results @extschema@.transfer_result[];
 
-    -- Rows that passed phases 1 and 2, in batch order; other fields come from inputs[ord].
+    -- Rows that passed phase 1, in batch order; other fields come from inputs[ord].
     candidate_count       integer;
     candidate_ord         integer[];
     candidate_id_group    integer[];   -- same number for rows sharing an id
@@ -235,12 +235,12 @@ BEGIN
         inputs := ARRAY(SELECT unnest(inputs));
     END IF;
 
-    -- Phases 1 and 2 plus phase 3's lock-free setup, before any lock is taken. Each CASE
-    -- returns the first failed check; phase 2 only sees phase-1 survivors.
-    WITH p1_values AS (
-        -- Phase 1: the row alone. 1e39 overflows numeric(39,0) and also catches NaN and
-        -- Infinity; NULL account ids fall through to phase 2's not-found checks.
-        SELECT t.ord, t.id, t.ledger_id, t.debit_account_id, t.credit_account_id, t.amount,
+    -- Phase 1 plus phase 2's lock-free setup, before any lock is taken.
+    WITH checks AS (
+        -- Phase 1: the first failed check, the row's own values before its lookups.
+        -- 1e39 overflows numeric(39,0) and also catches NaN and Infinity; NULL account ids
+        -- fall through to the not-found checks.
+        SELECT t.ord, t.id, t.debit_account_id, t.credit_account_id,
                CASE
                    WHEN t.id IS NULL THEN 'id_not_set'
                    WHEN t.amount IS NULL OR t.amount <= 0
@@ -249,41 +249,34 @@ BEGIN
                    WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
                    WHEN t.debit_account_id = t.credit_account_id
                        THEN 'accounts_must_be_different'
+                   WHEN tx.id  IS NOT NULL THEN 'id_already_exists'
+                   WHEN l.id  IS NULL THEN 'ledger_not_found'
+                   WHEN da.id IS NULL THEN 'debit_account_not_found'
+                   WHEN ca.id IS NULL THEN 'credit_account_not_found'
+                   WHEN da.ledger_id <> t.ledger_id THEN 'debit_account_ledger_mismatch'
+                   WHEN ca.ledger_id <> t.ledger_id THEN 'credit_account_ledger_mismatch'
                END AS fail
         FROM unnest(inputs) WITH ORDINALITY
              AS t(id, ledger_id, debit_account_id, credit_account_id,
                   amount, code, external_id, external_timestamp, ord)
-    ),
-    p2_relationships AS (
-        -- Phase 2: lookups.
-        SELECT p.ord, p.id, p.debit_account_id, p.credit_account_id,
-               CASE
-                   WHEN EXISTS (SELECT FROM @extschema@.transfers tx WHERE tx.id = p.id)
-                       THEN 'id_already_exists'
-                   WHEN l.id  IS NULL THEN 'ledger_not_found'
-                   WHEN da.id IS NULL THEN 'debit_account_not_found'
-                   WHEN ca.id IS NULL THEN 'credit_account_not_found'
-                   WHEN da.ledger_id <> p.ledger_id THEN 'debit_account_ledger_mismatch'
-                   WHEN ca.ledger_id <> p.ledger_id THEN 'credit_account_ledger_mismatch'
-               END AS fail
-        FROM p1_values p
-        LEFT JOIN @extschema@.ledgers  l  ON l.id  = p.ledger_id
-        LEFT JOIN @extschema@.accounts da ON da.id = p.debit_account_id
-        LEFT JOIN @extschema@.accounts ca ON ca.id = p.credit_account_id
-        WHERE p.fail IS NULL
-    ),
-    -- Every ord exactly once: phase-1 failures, then everything phase 2 saw.
-    outcomes AS (
-        SELECT p.ord, p.id, p.fail AS code FROM p1_values p WHERE p.fail IS NOT NULL
-        UNION ALL
-        SELECT r.ord, r.id, COALESCE(r.fail, 'ok') FROM p2_relationships r
+        -- One index probe per row. As plain joins or an EXISTS, the 10-row unnest estimate
+        -- gets hash joins over seq scans of accounts and ledgers and a hashed subplan over
+        -- all of transfers; LIMIT 1 keeps each lookup a parameterized subquery.
+        LEFT JOIN LATERAL (SELECT tx.id FROM @extschema@.transfers tx
+                           WHERE tx.id = t.id LIMIT 1) tx ON true
+        LEFT JOIN LATERAL (SELECT l.id FROM @extschema@.ledgers l
+                           WHERE l.id = t.ledger_id LIMIT 1) l ON true
+        LEFT JOIN LATERAL (SELECT a.id, a.ledger_id FROM @extschema@.accounts a
+                           WHERE a.id = t.debit_account_id LIMIT 1) da ON true
+        LEFT JOIN LATERAL (SELECT a.id, a.ledger_id FROM @extschema@.accounts a
+                           WHERE a.id = t.credit_account_id LIMIT 1) ca ON true
     ),
     candidates AS (
-        SELECT r.ord, r.id, r.debit_account_id, r.credit_account_id,
-               row_number() OVER (ORDER BY r.ord) AS candidate_index,
-               dense_rank()  OVER (ORDER BY r.id) AS id_group
-        FROM p2_relationships r
-        WHERE r.fail IS NULL
+        SELECT c.ord, c.id, c.debit_account_id, c.credit_account_id,
+               row_number() OVER (ORDER BY c.ord) AS candidate_index,
+               dense_rank()  OVER (ORDER BY c.id) AS id_group
+        FROM checks c
+        WHERE c.fail IS NULL
     ),
     -- Ranks come from one dense_rank over the legs. Don't join candidates back to ranks:
     -- generic plans assume unnest yields 10 rows, which makes that join quadratic.
@@ -309,9 +302,9 @@ BEGIN
            candidate_ord, candidate_id_group,
            candidate_debit_rank, candidate_credit_rank,
            ranked_accounts
-    FROM (SELECT array_agg(ROW(o.ord, o.id, o.code)::@extschema@.transfer_result
-                           ORDER BY o.ord) AS results
-          FROM outcomes o) result_array,
+    FROM (SELECT array_agg(ROW(c.ord, c.id, COALESCE(c.fail, 'ok'))::@extschema@.transfer_result
+                           ORDER BY c.ord) AS results
+          FROM checks c) result_array,
          (SELECT COALESCE(array_agg(cn.ord::int      ORDER BY cn.candidate_index), '{}') AS ords,
                  COALESCE(array_agg(cn.id_group::int ORDER BY cn.candidate_index), '{}') AS id_groups
           FROM candidates cn) candidate_arrays,
@@ -324,7 +317,7 @@ BEGIN
           FROM ranks rk
           JOIN @extschema@.accounts a ON a.id = rk.account_id) account_array;
 
-    -- Phase 3: balance rules.
+    -- Phase 2: balance rules.
     candidate_count := cardinality(candidate_ord);
 
     IF candidate_count > 0 THEN
