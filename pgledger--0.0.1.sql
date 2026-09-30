@@ -185,7 +185,7 @@ CREATE OR REPLACE FUNCTION @extschema@.create_transfers(inputs @extschema@.trans
 RETURNS SETOF @extschema@.transfer_result AS $$
 DECLARE
     -- ord: a row's 1-based position in inputs, its identity throughout (ids can repeat).
-    -- slot: 1..n per distinct account touched; account state lives in arrays indexed by slot.
+    -- rank: 1..n per distinct account touched; account state lives in arrays indexed by rank.
 
     -- One per input, indexed by ord. Phases 1 and 2 fill in every code; candidates start as
     -- 'ok' and the walk overwrites the ones it rejects.
@@ -195,12 +195,12 @@ DECLARE
     candidate_count       integer;
     candidate_ord         integer[];
     candidate_id_group    integer[];   -- same number for rows sharing an id
-    candidate_debit_slot  integer[];
-    candidate_credit_slot integer[];
+    candidate_debit_rank  integer[];
+    candidate_credit_rank integer[];
 
-    -- Per slot: the account, and its latest balance row as the walk advances it.
-    slot_accounts @extschema@.accounts[];
-    slot_balances @extschema@.account_balances[];
+    -- Per rank: the account, and its latest balance row as the walk advances it.
+    ranked_accounts @extschema@.accounts[];
+    ranked_balances @extschema@.account_balances[];
 
     id_group_posted boolean[];
 
@@ -213,8 +213,8 @@ DECLARE
     candidate_index integer;
     ord             integer;
     candidate       @extschema@.transfer_input;
-    debit_slot      integer;
-    credit_slot     integer;
+    debit_rank      integer;
+    credit_rank     integer;
     amount          numeric;
     debit_balance   @extschema@.account_balances;
     credit_balance  @extschema@.account_balances;
@@ -285,11 +285,11 @@ BEGIN
         FROM p2_relationships r
         WHERE r.fail IS NULL
     ),
-    -- Slots come from one dense_rank over the legs. Don't join candidates back to slots:
+    -- Ranks come from one dense_rank over the legs. Don't join candidates back to ranks:
     -- generic plans assume unnest yields 10 rows, which makes that join quadratic.
     legs AS (
         SELECT l.candidate_index, l.is_debit_leg, l.account_id,
-               dense_rank() OVER (ORDER BY l.account_id) AS slot
+               dense_rank() OVER (ORDER BY l.account_id) AS rank
         FROM (SELECT cn.candidate_index, true AS is_debit_leg,
                      cn.debit_account_id AS account_id
               FROM candidates cn
@@ -298,31 +298,31 @@ BEGIN
               FROM candidates cn) l
     ),
     -- Safe to read before the lock: accounts is immutable.
-    slots AS (
-        SELECT DISTINCT lg.slot, lg.account_id FROM legs lg
+    ranks AS (
+        SELECT DISTINCT lg.rank, lg.account_id FROM legs lg
     )
     SELECT result_array.results,
            candidate_arrays.ords, candidate_arrays.id_groups,
-           leg_arrays.debit_slots, leg_arrays.credit_slots,
-           slot_array.accounts
+           leg_arrays.debit_ranks, leg_arrays.credit_ranks,
+           account_array.accounts
       INTO results,
            candidate_ord, candidate_id_group,
-           candidate_debit_slot, candidate_credit_slot,
-           slot_accounts
+           candidate_debit_rank, candidate_credit_rank,
+           ranked_accounts
     FROM (SELECT array_agg(ROW(o.ord, o.id, o.code)::@extschema@.transfer_result
                            ORDER BY o.ord) AS results
           FROM outcomes o) result_array,
          (SELECT COALESCE(array_agg(cn.ord::int      ORDER BY cn.candidate_index), '{}') AS ords,
                  COALESCE(array_agg(cn.id_group::int ORDER BY cn.candidate_index), '{}') AS id_groups
           FROM candidates cn) candidate_arrays,
-         (SELECT COALESCE(array_agg(lg.slot::int ORDER BY lg.candidate_index)
-                              FILTER (WHERE lg.is_debit_leg), '{}') AS debit_slots,
-                 COALESCE(array_agg(lg.slot::int ORDER BY lg.candidate_index)
-                              FILTER (WHERE NOT lg.is_debit_leg), '{}') AS credit_slots
+         (SELECT COALESCE(array_agg(lg.rank::int ORDER BY lg.candidate_index)
+                              FILTER (WHERE lg.is_debit_leg), '{}') AS debit_ranks,
+                 COALESCE(array_agg(lg.rank::int ORDER BY lg.candidate_index)
+                              FILTER (WHERE NOT lg.is_debit_leg), '{}') AS credit_ranks
           FROM legs lg) leg_arrays,
-         (SELECT COALESCE(array_agg(a ORDER BY sl.slot), '{}') AS accounts
-          FROM slots sl
-          JOIN @extschema@.accounts a ON a.id = sl.account_id) slot_array;
+         (SELECT COALESCE(array_agg(a ORDER BY rk.rank), '{}') AS accounts
+          FROM ranks rk
+          JOIN @extschema@.accounts a ON a.id = rk.account_id) account_array;
 
     -- Phase 3: balance rules.
     candidate_count := cardinality(candidate_ord);
@@ -333,7 +333,7 @@ BEGIN
         PERFORM a.id FROM @extschema@.accounts a
         -- ANY over an array keeps this an index scan; IN (SELECT ... unnest) gets a hash
         -- join over a seq scan of accounts in the generic plan.
-        WHERE a.id = ANY(ARRAY(SELECT s.id FROM unnest(slot_accounts) s))
+        WHERE a.id = ANY(ARRAY(SELECT s.id FROM unnest(ranked_accounts) s))
         ORDER BY a.id
         FOR NO KEY UPDATE;
 
@@ -343,8 +343,8 @@ BEGIN
                              COALESCE(b.debits_posted, 0), COALESCE(b.credits_posted, 0)
                             )::@extschema@.account_balances
                          ORDER BY s.ordinality)
-          INTO slot_balances
-        FROM unnest(slot_accounts) WITH ORDINALITY AS s
+          INTO ranked_balances
+        FROM unnest(ranked_accounts) WITH ORDINALITY AS s
         LEFT JOIN LATERAL (
             SELECT ab.version, ab.debits_posted, ab.credits_posted
             FROM @extschema@.account_balances ab
@@ -368,25 +368,25 @@ BEGIN
         END IF;
 
         candidate   := inputs[ord];
-        debit_slot  := candidate_debit_slot[candidate_index];
-        credit_slot := candidate_credit_slot[candidate_index];
-        -- A balancing transfer would compute its amount here, from the slot balances.
+        debit_rank  := candidate_debit_rank[candidate_index];
+        credit_rank := candidate_credit_rank[candidate_index];
+        -- A balancing transfer would compute its amount here, from the ranked balances.
         amount      := candidate.amount;
 
-        -- Advance copies; a rejected row just drops them. Phase 1 guarantees the two slots
+        -- Advance copies; a rejected row just drops them. Phase 1 guarantees the two ranks
         -- differ.
-        debit_balance  := slot_balances[debit_slot];
-        credit_balance := slot_balances[credit_slot];
+        debit_balance  := ranked_balances[debit_rank];
+        credit_balance := ranked_balances[credit_rank];
         debit_balance.debits_posted   := debit_balance.debits_posted   + amount;
         credit_balance.credits_posted := credit_balance.credits_posted + amount;
 
         -- Each side can break only one rule; the debit account is checked first, as in
         -- TigerBeetle.
-        IF slot_accounts[debit_slot].require_credit_balance
+        IF ranked_accounts[debit_rank].require_credit_balance
            AND debit_balance.debits_posted > debit_balance.credits_posted THEN
             results[ord].code := 'exceeds_credits';
             CONTINUE;
-        ELSIF slot_accounts[credit_slot].require_debit_balance
+        ELSIF ranked_accounts[credit_rank].require_debit_balance
               AND credit_balance.credits_posted > credit_balance.debits_posted THEN
             results[ord].code := 'exceeds_debits';
             CONTINUE;
@@ -396,8 +396,8 @@ BEGIN
         debit_balance.transfer_id  := candidate.id;
         credit_balance.version     := credit_balance.version + 1;
         credit_balance.transfer_id := candidate.id;
-        slot_balances[debit_slot]  := debit_balance;
-        slot_balances[credit_slot] := credit_balance;
+        ranked_balances[debit_rank]  := debit_balance;
+        ranked_balances[credit_rank] := credit_balance;
         id_group_posted[candidate_id_group[candidate_index]] := true;
 
         new_transfer.id                 := candidate.id;
