@@ -97,38 +97,34 @@ ORDER BY ab.version;
 
 A transfer that would break a rule is rejected and the whole statement rolls back.
 
-## Draining an account
+## Balancing transfers
 
-To transfer an account's entire balance, lock the accounts, read the balance, and post
-that amount in one transaction. For example, to pay out whatever a customer's
+`balancing_debit` and `balancing_credit` on `ledger.transfer_input` work like TigerBeetle's
+flags of the same names: they make `amount` a maximum rather than an exact amount.
+
+- `balancing_debit`: move no more than keeps the debit account's debits from exceeding its
+  credits.
+- `balancing_credit`: move no more than keeps the credit account's credits from exceeding
+  its debits.
+- Both: move the smaller of the two.
+
+With either flag, a `NULL` amount means no cap. To pay out whatever a customer's
 credit-normal wallet holds:
 
 ```sql
-BEGIN;
-
--- Lock both accounts of the transfer, in id order, as posting does.
-SELECT id FROM ledger.accounts
-WHERE id IN ('...wallet-id...', '...cash-id...')
-ORDER BY id
-FOR NO KEY UPDATE;
-
-SELECT -balance AS amount FROM ledger.current_balances WHERE account_id = '...wallet-id...';
-
--- If amount > 0:
-INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount, code)
-VALUES ('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...', :amount, 3);
-
-COMMIT;
+SELECT * FROM ledger.create_transfers(ARRAY[
+    ROW('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...',
+        NULL, 3, NULL, NULL, true, false)::ledger.transfer_input
+]);
 ```
 
-Lock `ledger.accounts` rows, which is what posting waits on. Locking `ledger.account_balances`
-rows doesn't block other postings, and an account that has never been posted to has no
-balance rows to lock. Lock both accounts, not just the one being drained: taking one first
-and the other when the transfer posts can deadlock with a concurrent posting.
-
-Use `READ COMMITTED`. Under `REPEATABLE READ` or `SERIALIZABLE` the balance you read can be
-older than the lock; the insert then fails with a unique violation and the transaction must
-be retried.
+The amount is worked out while posting holds the account locks, against the balance left
+by any earlier rows in the same batch, so there is no read-then-write race to manage. The
+clamp applies whatever balance rules the accounts have, and those rules are still checked
+afterwards. `ledger.transfers.amount` records what actually moved, and the stored
+`balancing_debit` and `balancing_credit` columns record that the transfer was a balancing one.
+If nothing would move, the row is rejected: with `exceeds_credits` if the debit side is
+balancing and already at zero, and `exceeds_debits` otherwise.
 
 ## Your data on accounts and transfers
 
@@ -177,14 +173,13 @@ FOR NO KEY UPDATE;
 ```
 
 The locks are held until the transaction ends, so each posting re-requests locks the
-transaction already holds and never acquires one out of order. This is the same technique as
-[Draining an account](#draining-an-account), widened to every account in the sequence.
+transaction already holds and never acquires one out of order.
 
 ## Constraints
 
 - Accounts must belong to an existing ledger.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
-- `amount` must be positive.
+- `amount` must be positive. It may be `NULL` (no cap) only on a balancing transfer.
 - `code` must be positive.
 - `created_at` is assigned by the ledger; supplying it is rejected.
 - An account can require a debit balance or a credit balance, but not both.

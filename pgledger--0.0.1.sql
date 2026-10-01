@@ -92,7 +92,8 @@ CREATE TRIGGER accounts_immutable
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
 -- Value flows credit -> debit. create_transfers() validates accounts and ledgers itself; the
--- CHECKs are backstops. It also stamps created_at.
+-- CHECKs are backstops. It also stamps created_at. For a balancing transfer amount is what
+-- actually moved, after the clamp; the flags record that it was one.
 CREATE TABLE @extschema@.transfers (
     id                 uuid          PRIMARY KEY,
     created_at         timestamptz   NOT NULL,
@@ -103,6 +104,9 @@ CREATE TABLE @extschema@.transfers (
     code               integer       NOT NULL CHECK (code BETWEEN 1 AND 65535),
     external_id        uuid,
     external_timestamp timestamptz,
+
+    balancing_debit    boolean       NOT NULL DEFAULT false,
+    balancing_credit   boolean       NOT NULL DEFAULT false,
 
     CHECK (debit_account_id <> credit_account_id)
 );
@@ -152,6 +156,10 @@ REVOKE INSERT ON @extschema@.transfers, @extschema@.account_balances FROM PUBLIC
 
 
 -- One row of a create_transfers() batch; every rule is checked there and reported as a code.
+-- The balancing flags make amount a maximum, as in TigerBeetle: balancing_debit moves no more
+-- than keeps the debit account's debits from exceeding its credits, balancing_credit no more
+-- than keeps the credit account's credits from exceeding its debits, and both take the
+-- smaller. With either flag a NULL amount means no cap. A NULL flag counts as false.
 CREATE TYPE @extschema@.transfer_input AS (
     id                 uuid,
     ledger_id          uuid,
@@ -160,7 +168,9 @@ CREATE TYPE @extschema@.transfer_input AS (
     amount             numeric,
     code               integer,
     external_id        uuid,
-    external_timestamp timestamptz
+    external_timestamp timestamptz,
+    balancing_debit    boolean,
+    balancing_credit   boolean
 );
 
 -- One row of create_transfers()'s result, in input order. code is 'ok' or the first failed
@@ -170,7 +180,8 @@ CREATE TYPE @extschema@.transfer_input AS (
 --   relationships: id_already_exists, ledger_not_found, debit_account_not_found,
 --                  credit_account_not_found, debit_account_ledger_mismatch,
 --                  credit_account_ledger_mismatch
---   balances:      exceeds_credits, exceeds_debits
+--   balances:      exceeds_credits, exceeds_debits (also a balancing transfer that would move
+--                  nothing: exceeds_credits if the debit side is balancing and already at zero)
 CREATE TYPE @extschema@.transfer_result AS (
     ord         integer,
     transfer_id uuid,
@@ -243,8 +254,11 @@ BEGIN
         SELECT t.ord, t.id, t.debit_account_id, t.credit_account_id,
                CASE
                    WHEN t.id IS NULL THEN 'id_not_set'
-                   WHEN t.amount IS NULL OR t.amount <= 0
-                        OR t.amount <> trunc(t.amount) OR t.amount >= 1e39
+                   -- NULL is no cap, allowed only on a balancing transfer.
+                   WHEN CASE WHEN t.amount IS NULL
+                             THEN NOT (t.balancing_debit IS TRUE OR t.balancing_credit IS TRUE)
+                             ELSE t.amount <= 0 OR t.amount <> trunc(t.amount) OR t.amount >= 1e39
+                        END
                        THEN 'amount_must_be_positive'
                    WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
                    WHEN t.debit_account_id = t.credit_account_id
@@ -258,7 +272,8 @@ BEGIN
                END AS fail
         FROM unnest(inputs) WITH ORDINALITY
              AS t(id, ledger_id, debit_account_id, credit_account_id,
-                  amount, code, external_id, external_timestamp, ord)
+                  amount, code, external_id, external_timestamp,
+                  balancing_debit, balancing_credit, ord)
         -- One index probe per row. As plain joins or an EXISTS, the 10-row unnest estimate
         -- gets hash joins over seq scans of accounts and ledgers and a hashed subplan over
         -- all of transfers; LIMIT 1 keeps each lookup a parameterized subquery.
@@ -363,8 +378,28 @@ BEGIN
         candidate   := inputs[ord];
         debit_rank  := candidate_debit_rank[candidate_index];
         credit_rank := candidate_credit_rank[candidate_index];
-        -- A balancing transfer would compute its amount here, from the ranked balances.
+        -- Balancing clamps toward zero balance. LEAST ignores NULL, so an uncapped amount
+        -- takes the whole available balance.
         amount      := candidate.amount;
+        IF candidate.balancing_debit THEN
+            amount := LEAST(amount, GREATEST(0, ranked_balances[debit_rank].credits_posted
+                                                - ranked_balances[debit_rank].debits_posted));
+        END IF;
+        IF candidate.balancing_credit THEN
+            amount := LEAST(amount, GREATEST(0, ranked_balances[credit_rank].debits_posted
+                                                - ranked_balances[credit_rank].credits_posted));
+        END IF;
+        -- Nothing to move: rejected, as in TigerBeetle, with the debit side reported first.
+        IF amount = 0 THEN
+            results[ord].code := CASE
+                WHEN candidate.balancing_debit
+                     AND ranked_balances[debit_rank].credits_posted
+                         <= ranked_balances[debit_rank].debits_posted
+                    THEN 'exceeds_credits'
+                ELSE 'exceeds_debits'
+            END;
+            CONTINUE;
+        END IF;
 
         -- Advance copies; a rejected row just drops them. Phase 1 guarantees the two ranks
         -- differ.
@@ -402,6 +437,8 @@ BEGIN
         new_transfer.code               := candidate.code;
         new_transfer.external_id        := candidate.external_id;
         new_transfer.external_timestamp := candidate.external_timestamp;
+        new_transfer.balancing_debit    := COALESCE(candidate.balancing_debit,  false);
+        new_transfer.balancing_credit   := COALESCE(candidate.balancing_credit, false);
 
         accepted_count := accepted_count + 1;
         new_transfers[accepted_count]        := new_transfer;

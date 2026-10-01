@@ -113,7 +113,7 @@ func insertSQL(schema string) string {
 	q := pgx.Identifier{schema}.Sanitize()
 	return fmt.Sprintf(`SELECT count(*) FILTER (WHERE code <> 'ok')
 FROM %s.create_transfers(ARRAY(
-    SELECT ROW(t.id, t.ledger, t.debit, t.credit, t.amount, t.code, t.ext, NULL)::%s.transfer_input
+    SELECT ROW(t.id, t.ledger, t.debit, t.credit, t.amount, t.code, t.ext, NULL, NULL, NULL)::%s.transfer_input
     FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[], $5::numeric[], $6::int[], $7::uuid[])
          AS t(id, ledger, debit, credit, amount, code, ext)
 ))`, q, q)
