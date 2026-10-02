@@ -33,17 +33,27 @@ INSERT INTO ledger.ledgers (id) VALUES ('...ledger-id...');
 `ledger.ledgers` is intentionally bare. Keep mutable attributes such as a name in your own
 table keyed by `ledger_id uuid PRIMARY KEY REFERENCES ledger.ledgers(id)`.
 
-Create accounts. Each account may optionally restrict which side its balance can be on:
+Create accounts with `ledger.create_accounts()`, which takes an array of `ledger.accounts`
+rows with `timestamp` left `NULL`. Each account may optionally restrict which side its
+balance can be on. The fields are `id, ledger_id, code, external_id, external_timestamp,
+require_credit_balance, require_debit_balance, timestamp`:
 
 ```sql
--- cash (code 1 in this example): debit-normal, cannot go below zero
-INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance)
-VALUES ('...cash-id...', '...ledger-id...', 1, true);
-
--- revenue (code 2): credit-normal, cannot go below zero
-INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
-VALUES ('...revenue-id...', '...ledger-id...', 2, true);
+SELECT * FROM ledger.create_accounts(ARRAY[
+    -- cash (code 1 in this example): debit-normal, cannot go below zero
+    ROW('...cash-id...', '...ledger-id...', 1, NULL, NULL, false, true, NULL)::ledger.accounts,
+    -- revenue (code 2): credit-normal, cannot go below zero
+    ROW('...revenue-id...', '...ledger-id...', 2, NULL, NULL, true, false, NULL)::ledger.accounts
+]);
 ```
+
+It returns one `(ord, account_id, code)` row per input, in input order. `code` is `ok` or the
+first failed check: `timestamp_must_not_be_set`, `id_not_set`, `code_invalid`,
+`flags_are_mutually_exclusive` (both balance requirements set), `id_already_exists`, or
+`ledger_not_found`. A rejected row doesn't stop the others from being created, and a `NULL`
+balance requirement counts as `false`. When an id appears more than once in a batch, only
+its first valid copy is created. A retry is safe: accounts that already exist come back as
+`id_already_exists`.
 
 Post a transfer. Value flows credit -> debit, so recording a sale debits cash and credits
 revenue:
@@ -182,14 +192,15 @@ transaction already holds and never acquires one out of order.
 - `amount` must be positive. It may be `NULL` (no cap) only on a balancing transfer.
 - `code` must be positive.
 - `timestamp` is assigned by the ledger; supplying it is rejected (`timestamp_must_not_be_set`
-  on a transfer, an error on a ledger or account).
+  on an account or transfer, an error on a ledger).
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected.
-- Only `ledger.create_transfers()` writes `ledger.transfers` and `ledger.account_balances`.
-  It runs as the extension's owner (`SECURITY DEFINER`); any other role that inserts
+- Only `ledger.create_accounts()` writes `ledger.accounts`, and only
+  `ledger.create_transfers()` writes `ledger.transfers` and `ledger.account_balances`.
+  Both run as the extension's owner (`SECURITY DEFINER`); any other role that inserts
   directly is rejected, even if it has been granted `INSERT`. Grant your app roles
-  `EXECUTE` on the function, not `INSERT` on the tables.
+  `EXECUTE` on the functions, not `INSERT` on the tables.
 
 ## Benchmark
 

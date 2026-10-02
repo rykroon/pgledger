@@ -5,14 +5,14 @@ INSERT INTO ledger.ledgers (id)
 VALUES ('11111111-1111-1111-1111-111111111111');
 
 -- cash: debit-normal, credits may never exceed debits.
-INSERT INTO ledger.accounts (id, ledger_id, code, require_debit_balance)
-VALUES ('22222222-2222-2222-2222-222222222222',
-        '11111111-1111-1111-1111-111111111111', 1, true);
-
 -- revenue: credit-normal, debits may never exceed credits.
-INSERT INTO ledger.accounts (id, ledger_id, code, require_credit_balance)
-VALUES ('33333333-3333-3333-3333-333333333333',
-        '11111111-1111-1111-1111-111111111111', 2, true);
+-- Direct INSERTs into ledger.accounts are rejected; accounts go through create_accounts().
+SELECT * FROM ledger.create_accounts(ARRAY[
+    ROW('22222222-2222-2222-2222-222222222222',
+        '11111111-1111-1111-1111-111111111111', 1, NULL, NULL, false, true, NULL)::ledger.accounts,
+    ROW('33333333-3333-3333-3333-333333333333',
+        '11111111-1111-1111-1111-111111111111', 2, NULL, NULL, true, false, NULL)::ledger.accounts
+]);
 
 -- A sale: value flows credit -> debit, so cash is debited and revenue credited.
 -- Direct INSERTs into ledger.transfers are rejected; posting goes through create_transfers().

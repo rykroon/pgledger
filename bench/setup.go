@@ -86,8 +86,14 @@ func setupWorld(ctx context.Context, cfg *config, conns []*pgx.Conn, runID uuid.
 		chunks <- rows[i:min(i+accountChunk, len(rows))]
 	}
 	close(chunks)
-	accountSQL := fmt.Sprintf(`INSERT INTO %s.accounts (id, ledger_id, code, external_id, require_debit_balance)
-SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::bool[])`, pgx.Identifier{cfg.schema}.Sanitize())
+	// Same shape as insertSQL: built server-side, folded to a count of rejected rows.
+	q := pgx.Identifier{cfg.schema}.Sanitize()
+	accountSQL := fmt.Sprintf(`SELECT count(*) FILTER (WHERE code <> 'ok')
+FROM %s.create_accounts(ARRAY(
+    SELECT ROW(a.id, a.ledger, a.code, a.ext, NULL, false, a.require_debit, NULL)::%s.accounts
+    FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::bool[])
+         AS a(id, ledger, code, ext, require_debit)
+))`, q, q)
 	err := parallel(ctx, len(conns), func(ctx context.Context, i int) error {
 		for chunk := range chunks {
 			n := len(chunk)
@@ -96,8 +102,12 @@ SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::bool[])`
 			for k, r := range chunk {
 				ids[k], ledgers[k], codes[k], ext[k], rules[k] = r.id, r.ledger, r.code, runID, r.requireDebit
 			}
-			if _, err := conns[i].Exec(ctx, accountSQL, ids, ledgers, codes, ext, rules); err != nil {
+			var rejected int64
+			if err := conns[i].QueryRow(ctx, accountSQL, ids, ledgers, codes, ext, rules).Scan(&rejected); err != nil {
 				return fmt.Errorf("create accounts: %w", err)
+			}
+			if rejected > 0 {
+				return fmt.Errorf("create accounts: %d rows rejected", rejected)
 			}
 		}
 		return nil

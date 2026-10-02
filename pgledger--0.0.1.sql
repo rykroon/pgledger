@@ -9,7 +9,7 @@ $$ LANGUAGE plpgsql;
 
 
 -- Stamps timestamp; callers can't supply it. clock_timestamp() gives each row its own time,
--- though not a unique one. Transfers are stamped by create_transfers() instead.
+-- though not a unique one. Accounts and transfers are stamped by their create functions instead.
 CREATE OR REPLACE FUNCTION @extschema@.set_timestamp()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -23,16 +23,17 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- Only create_transfers() may write. It runs as SECURITY DEFINER, so its inserts run as the
--- table owner; anyone else granted INSERT is rejected here. The owner itself is trusted.
+-- Only the table's create function, named by the trigger argument, may write. It runs as
+-- SECURITY DEFINER, so its inserts run as the table owner; anyone else granted INSERT is
+-- rejected here. The owner itself is trusted.
 CREATE OR REPLACE FUNCTION @extschema@.raise_direct_insert()
 RETURNS TRIGGER AS $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c
                    WHERE c.oid = TG_RELID
                      AND pg_catalog.pg_get_userbyid(c.relowner) = current_user) THEN
-        RAISE EXCEPTION '%.% is written by %.create_transfers(); INSERTing into it directly is not allowed',
-            TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_TABLE_SCHEMA;
+        RAISE EXCEPTION '%.% is written by %.%(); INSERTing into it directly is not allowed',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_TABLE_SCHEMA, TG_ARGV[0];
     END IF;
     RETURN NULL;
 END;
@@ -56,7 +57,8 @@ CREATE TRIGGER ledgers_immutable
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
 -- code, external_id and external_timestamp are opaque caller data. Both balance requirements
--- at once would pin the balance to zero.
+-- at once would pin the balance to zero. create_accounts() checks every rule and reports it as
+-- a code, and stamps timestamp; the CHECKs and the ledger FK are backstops.
 CREATE TABLE @extschema@.accounts (
     id                 uuid        PRIMARY KEY,
     ledger_id          uuid        NOT NULL REFERENCES @extschema@.ledgers(id),
@@ -84,9 +86,9 @@ CREATE INDEX accounts_external_id_idx ON @extschema@.accounts (external_id)
 CREATE INDEX accounts_external_timestamp_idx ON @extschema@.accounts (external_timestamp)
     WHERE external_timestamp IS NOT NULL;
 
-CREATE TRIGGER accounts_set_timestamp
+CREATE TRIGGER accounts_no_direct_insert
     BEFORE INSERT ON @extschema@.accounts
-    FOR EACH ROW EXECUTE FUNCTION @extschema@.set_timestamp();
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert('create_accounts');
 
 CREATE TRIGGER accounts_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.accounts
@@ -130,7 +132,7 @@ CREATE INDEX transfers_external_timestamp_idx ON @extschema@.transfers (external
 
 CREATE TRIGGER transfers_no_direct_insert
     BEFORE INSERT ON @extschema@.transfers
-    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert('create_transfers');
 
 CREATE TRIGGER transfers_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.transfers
@@ -151,15 +153,102 @@ CREATE TABLE @extschema@.account_balances (
 
 CREATE TRIGGER account_balances_no_direct_insert
     BEFORE INSERT ON @extschema@.account_balances
-    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert();
+    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_direct_insert('create_transfers');
 
 CREATE TRIGGER account_balances_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.account_balances
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- Posting goes through create_transfers(). Grants to named roles (e.g. default privileges)
--- aren't covered by this; the no_direct_insert triggers reject those.
-REVOKE INSERT ON @extschema@.transfers, @extschema@.account_balances FROM PUBLIC;
+-- Accounts go through create_accounts() and posting through create_transfers(). Grants to
+-- named roles (e.g. default privileges) aren't covered by this; the no_direct_insert triggers
+-- reject those.
+REVOKE INSERT ON @extschema@.accounts, @extschema@.transfers, @extschema@.account_balances
+    FROM PUBLIC;
+
+
+-- One row of create_accounts()'s result, in input order. code is 'ok' or the first failed
+-- check:
+--   values:        timestamp_must_not_be_set, id_not_set, code_invalid,
+--                  flags_are_mutually_exclusive (both balance requirements set)
+--   relationships: id_already_exists, ledger_not_found
+CREATE TYPE @extschema@.account_result AS (
+    ord        integer,
+    account_id uuid,
+    code       text
+);
+
+-- Creates a batch of accounts, each row getting its own result; a rejected row doesn't abort
+-- the others. Inputs are accounts rows with timestamp left NULL. A NULL balance requirement
+-- counts as false. A repeated id is created at most once: the first copy that passes the other
+-- checks wins and later copies get id_already_exists. A concurrent insert of the same id fails
+-- the whole call on the primary key.
+CREATE OR REPLACE FUNCTION @extschema@.create_accounts(inputs @extschema@.accounts[])
+RETURNS SETOF @extschema@.account_result AS $$
+BEGIN
+    IF inputs IS NULL OR cardinality(inputs) = 0 THEN
+        RETURN;
+    END IF;
+
+    -- accounts[] accepts any number of dimensions; Postgres doesn't enforce them.
+    IF array_ndims(inputs) <> 1 THEN
+        RAISE EXCEPTION 'create_accounts expects a one-dimensional array, got % dimensions',
+            array_ndims(inputs);
+    END IF;
+
+    RETURN QUERY
+    WITH checks AS (
+        -- The first failed check, the row's own values before its lookups. A NULL ledger_id
+        -- falls through to ledger_not_found.
+        SELECT t.*,
+               CASE
+                   WHEN t.timestamp IS NOT NULL THEN 'timestamp_must_not_be_set'
+                   WHEN t.id IS NULL THEN 'id_not_set'
+                   WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
+                   WHEN t.require_credit_balance AND t.require_debit_balance
+                       THEN 'flags_are_mutually_exclusive'
+                   WHEN a.id IS NOT NULL THEN 'id_already_exists'
+                   WHEN l.id IS NULL THEN 'ledger_not_found'
+               END AS fail
+        -- ORDINALITY counts from 1 whatever the array's lower bound, so no rebase is needed.
+        FROM unnest(inputs) WITH ORDINALITY
+             AS t(id, ledger_id, code, external_id, external_timestamp,
+                  require_credit_balance, require_debit_balance, timestamp, ord)
+        -- One index probe per row; see create_transfers() for why LIMIT 1.
+        LEFT JOIN LATERAL (SELECT a.id FROM @extschema@.accounts a
+                           WHERE a.id = t.id LIMIT 1) a ON true
+        LEFT JOIN LATERAL (SELECT l.id FROM @extschema@.ledgers l
+                           WHERE l.id = t.ledger_id LIMIT 1) l ON true
+    ),
+    -- Repeats within the batch, counted only among rows that passed, so a rejected first copy
+    -- doesn't block a later one.
+    results AS (
+        SELECT c.*,
+               CASE
+                   WHEN c.fail IS NOT NULL THEN c.fail
+                   WHEN row_number() OVER (PARTITION BY c.fail IS NULL, c.id ORDER BY c.ord) > 1
+                       THEN 'id_already_exists'
+               END AS outcome
+        FROM checks c
+    ),
+    insert_accounts AS (
+        INSERT INTO @extschema@.accounts
+        SELECT r.id, r.ledger_id, r.code, r.external_id, r.external_timestamp,
+               COALESCE(r.require_credit_balance, false),
+               COALESCE(r.require_debit_balance,  false),
+               clock_timestamp()
+        FROM results r
+        WHERE r.outcome IS NULL
+        ORDER BY r.ord
+    )
+    SELECT r.ord::integer, r.id, COALESCE(r.outcome, 'ok')
+    FROM results r
+    ORDER BY r.ord;
+END;
+$$ LANGUAGE plpgsql
+-- Runs as the owner, the only role that may insert into accounts.
+SECURITY DEFINER
+SET search_path = @extschema@, pg_temp
+SET plan_cache_mode = force_generic_plan;
 
 
 -- One row of create_transfers()'s result, in input order. code is 'ok' or the first failed
