@@ -55,7 +55,7 @@ VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id.
 
 A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
 and enforces the balance rules. A multi-row `INSERT` posts every row, and a failure anywhere
-rolls back the whole statement. A batch may span ledgers. Rows post in `created_at` order,
+rolls back the whole statement. A batch may span ledgers. Rows post in `timestamp` order,
 which in practice is the order the statement produced them, but Postgres doesn't guarantee
 that order, so don't rely on it.
 
@@ -82,7 +82,7 @@ running `debits_posted` and `credits_posted` after that transfer. `version` coun
 account's postings from 1 and is their order; join `ledger.transfers` for timestamps:
 
 ```sql
-SELECT ab.version, ab.debits_posted - ab.credits_posted AS balance, t.created_at
+SELECT ab.version, ab.debits_posted - ab.credits_posted AS balance, t.timestamp
 FROM ledger.account_balances ab
 JOIN ledger.transfers t ON t.id = ab.transfer_id
 WHERE ab.account_id = '...cash-id...'
@@ -99,7 +99,7 @@ A transfer that would break a rule is rejected and the whole statement rolls bac
 
 ## Balancing transfers
 
-`balancing_debit` and `balancing_credit` on `ledger.transfer_input` work like TigerBeetle's
+`balancing_debit` and `balancing_credit` on `ledger.transfers` work like TigerBeetle's
 flags of the same names: they make `amount` a maximum rather than an exact amount.
 
 - `balancing_debit`: move no more than keeps the debit account's debits from exceeding its
@@ -114,7 +114,7 @@ credit-normal wallet holds:
 ```sql
 SELECT * FROM ledger.create_transfers(ARRAY[
     ROW('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...',
-        NULL, 3, NULL, NULL, true, false)::ledger.transfer_input
+        NULL, 3, NULL, NULL, true, false, NULL)::ledger.transfers
 ]);
 ```
 
@@ -138,13 +138,13 @@ them but never interprets them:
   customer, an order, or a group of related transfers.
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
   date or the original time of an imported record. It doesn't change the order balances
-  are applied in. `created_at` is always set by the ledger, never by you, to the clock time
+  are applied in. `timestamp` is always set by the ledger, never by you, to the clock time
   the row was inserted. Rows get their own times, even within one statement, but it is not
   unique: two rows can share a microsecond.
 
 Transfers have no total order. Within one account, `ledger.account_balances.version` is the
-order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
-for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `created_at` is
+order of record. Across a ledger there is none, so order a transfer log by `timestamp, id`
+for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `timestamp` is
 taken while posting holds the account locks, so within one account it follows `version`, but
 across accounts it can disagree with the order transactions commit in.
 
@@ -181,7 +181,8 @@ transaction already holds and never acquires one out of order.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
 - `amount` must be positive. It may be `NULL` (no cap) only on a balancing transfer.
 - `code` must be positive.
-- `created_at` is assigned by the ledger; supplying it is rejected.
+- `timestamp` is assigned by the ledger; supplying it is rejected (`timestamp_must_not_be_set`
+  on a transfer, an error on a ledger or account).
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected.

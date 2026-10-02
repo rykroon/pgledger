@@ -8,16 +8,16 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- Stamps created_at; callers can't supply it. clock_timestamp() gives each row its own time,
+-- Stamps timestamp; callers can't supply it. clock_timestamp() gives each row its own time,
 -- though not a unique one. Transfers are stamped by create_transfers() instead.
-CREATE OR REPLACE FUNCTION @extschema@.set_created_at()
+CREATE OR REPLACE FUNCTION @extschema@.set_timestamp()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.created_at IS NOT NULL THEN
-        RAISE EXCEPTION '%.%.created_at is assigned by the ledger and cannot be supplied',
+    IF NEW.timestamp IS NOT NULL THEN
+        RAISE EXCEPTION '%.%.timestamp is assigned by the ledger and cannot be supplied',
             TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
-    NEW.created_at := clock_timestamp();
+    NEW.timestamp := clock_timestamp();
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -41,15 +41,15 @@ $$ LANGUAGE plpgsql;
 
 -- Deliberately bare; mutable attributes belong in the caller's own table keyed by ledger_id.
 CREATE TABLE @extschema@.ledgers (
-    id         uuid        PRIMARY KEY,
-    created_at timestamptz NOT NULL
+    id        uuid        PRIMARY KEY,
+    timestamp timestamptz NOT NULL
 );
 
-CREATE INDEX ledgers_created_at_idx ON @extschema@.ledgers (created_at);
+CREATE INDEX ledgers_timestamp_idx ON @extschema@.ledgers (timestamp);
 
-CREATE TRIGGER ledgers_set_created_at
+CREATE TRIGGER ledgers_set_timestamp
     BEFORE INSERT ON @extschema@.ledgers
-    FOR EACH ROW EXECUTE FUNCTION @extschema@.set_created_at();
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.set_timestamp();
 
 CREATE TRIGGER ledgers_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.ledgers
@@ -59,7 +59,6 @@ CREATE TRIGGER ledgers_immutable
 -- at once would pin the balance to zero.
 CREATE TABLE @extschema@.accounts (
     id                 uuid        PRIMARY KEY,
-    created_at         timestamptz NOT NULL,
     ledger_id          uuid        NOT NULL REFERENCES @extschema@.ledgers(id),
     code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
     external_id        uuid,
@@ -68,6 +67,8 @@ CREATE TABLE @extschema@.accounts (
     require_credit_balance boolean NOT NULL DEFAULT false,
     require_debit_balance  boolean NOT NULL DEFAULT false,
 
+    timestamp          timestamptz NOT NULL,
+
     CONSTRAINT accounts_one_balance_requirement
         CHECK (NOT (require_credit_balance AND require_debit_balance)),
 
@@ -75,7 +76,7 @@ CREATE TABLE @extschema@.accounts (
     UNIQUE (id, ledger_id)
 );
 
-CREATE INDEX accounts_created_at_idx ON @extschema@.accounts (created_at);
+CREATE INDEX accounts_timestamp_idx ON @extschema@.accounts (timestamp);
 CREATE INDEX accounts_ledger_id_idx ON @extschema@.accounts (ledger_id);
 CREATE INDEX accounts_code_idx ON @extschema@.accounts (code);
 CREATE INDEX accounts_external_id_idx ON @extschema@.accounts (external_id)
@@ -83,38 +84,44 @@ CREATE INDEX accounts_external_id_idx ON @extschema@.accounts (external_id)
 CREATE INDEX accounts_external_timestamp_idx ON @extschema@.accounts (external_timestamp)
     WHERE external_timestamp IS NOT NULL;
 
-CREATE TRIGGER accounts_set_created_at
+CREATE TRIGGER accounts_set_timestamp
     BEFORE INSERT ON @extschema@.accounts
-    FOR EACH ROW EXECUTE FUNCTION @extschema@.set_created_at();
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.set_timestamp();
 
 CREATE TRIGGER accounts_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.accounts
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
 -- Value flows credit -> debit. create_transfers() validates accounts and ledgers itself; the
--- CHECKs are backstops. It also stamps created_at. For a balancing transfer amount is what
+-- CHECKs are backstops. It also stamps timestamp. For a balancing transfer amount is what
 -- actually moved, after the clamp; the flags record that it was one.
+--
+-- The row type is also create_transfers()'s input, where every rule is checked and reported
+-- as a code. amount is plain numeric so that a cast into this type can't round a fraction or
+-- overflow before those checks see it; the CHECK holds the range numeric(39,0) would.
 CREATE TABLE @extschema@.transfers (
-    id                 uuid          PRIMARY KEY,
-    created_at         timestamptz   NOT NULL,
-    ledger_id          uuid          NOT NULL,
-    debit_account_id   uuid          NOT NULL,
-    credit_account_id  uuid          NOT NULL,
-    amount             numeric(39,0) NOT NULL CHECK (amount > 0),
-    code               integer       NOT NULL CHECK (code BETWEEN 1 AND 65535),
+    id                 uuid        PRIMARY KEY,
+    ledger_id          uuid        NOT NULL,
+    debit_account_id   uuid        NOT NULL,
+    credit_account_id  uuid        NOT NULL,
+    amount             numeric     NOT NULL
+        CHECK (amount > 0 AND amount = trunc(amount) AND amount < 1e39),
+    code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
     external_id        uuid,
     external_timestamp timestamptz,
 
-    balancing_debit    boolean       NOT NULL DEFAULT false,
-    balancing_credit   boolean       NOT NULL DEFAULT false,
+    balancing_debit    boolean     NOT NULL DEFAULT false,
+    balancing_credit   boolean     NOT NULL DEFAULT false,
+
+    timestamp          timestamptz NOT NULL,
 
     CHECK (debit_account_id <> credit_account_id)
 );
 
 CREATE INDEX transfers_debit_account_id_idx ON @extschema@.transfers (debit_account_id);
 CREATE INDEX transfers_credit_account_id_idx ON @extschema@.transfers (credit_account_id);
-CREATE INDEX transfers_ledger_id_created_at_idx ON @extschema@.transfers (ledger_id, created_at);
-CREATE INDEX transfers_created_at_idx ON @extschema@.transfers (created_at);
+CREATE INDEX transfers_ledger_id_timestamp_idx ON @extschema@.transfers (ledger_id, timestamp);
+CREATE INDEX transfers_timestamp_idx ON @extschema@.transfers (timestamp);
 CREATE INDEX transfers_code_idx ON @extschema@.transfers (code);
 CREATE INDEX transfers_external_id_idx ON @extschema@.transfers (external_id)
     WHERE external_id IS NOT NULL;
@@ -155,28 +162,10 @@ CREATE TRIGGER account_balances_immutable
 REVOKE INSERT ON @extschema@.transfers, @extschema@.account_balances FROM PUBLIC;
 
 
--- One row of a create_transfers() batch; every rule is checked there and reported as a code.
--- The balancing flags make amount a maximum, as in TigerBeetle: balancing_debit moves no more
--- than keeps the debit account's debits from exceeding its credits, balancing_credit no more
--- than keeps the credit account's credits from exceeding its debits, and both take the
--- smaller. With either flag a NULL amount means no cap. A NULL flag counts as false.
-CREATE TYPE @extschema@.transfer_input AS (
-    id                 uuid,
-    ledger_id          uuid,
-    debit_account_id   uuid,
-    credit_account_id  uuid,
-    amount             numeric,
-    code               integer,
-    external_id        uuid,
-    external_timestamp timestamptz,
-    balancing_debit    boolean,
-    balancing_credit   boolean
-);
-
 -- One row of create_transfers()'s result, in input order. code is 'ok' or the first failed
 -- check:
---   values:        id_not_set, amount_must_be_positive, code_invalid,
---                  accounts_must_be_different
+--   values:        timestamp_must_not_be_set, id_not_set, amount_must_be_positive,
+--                  code_invalid, accounts_must_be_different
 --   relationships: id_already_exists, ledger_not_found, debit_account_not_found,
 --                  credit_account_not_found, debit_account_ledger_mismatch,
 --                  credit_account_ledger_mismatch
@@ -189,10 +178,14 @@ CREATE TYPE @extschema@.transfer_result AS (
 );
 
 -- Posts a batch TigerBeetle-style: each row gets its own result and a rejected row doesn't
--- abort the others. Phase 2 is one linear walk over in-memory balances in batch order, so a
+-- abort the others. Inputs are transfers rows with timestamp left NULL. The balancing flags
+-- make amount a maximum, as in TigerBeetle: balancing_debit moves no more than keeps the debit
+-- account's debits from exceeding its credits, balancing_credit no more than keeps the credit
+-- account's credits from exceeding its debits, and both take the smaller. With either flag a
+-- NULL amount means no cap. A NULL flag counts as false. Phase 2 is one linear walk over in-memory balances in batch order, so a
 -- rejected row never affects later ones. A repeated id posts at most once; later copies get
 -- id_already_exists. A concurrent insert of the same id fails the whole call on the primary key.
-CREATE OR REPLACE FUNCTION @extschema@.create_transfers(inputs @extschema@.transfer_input[])
+CREATE OR REPLACE FUNCTION @extschema@.create_transfers(inputs @extschema@.transfers[])
 RETURNS SETOF @extschema@.transfer_result AS $$
 DECLARE
     -- ord: a row's 1-based position in inputs, its identity throughout (ids can repeat).
@@ -223,7 +216,7 @@ DECLARE
 
     candidate_index integer;
     ord             integer;
-    candidate       @extschema@.transfer_input;
+    candidate       @extschema@.transfers;
     debit_rank      integer;
     credit_rank     integer;
     amount          numeric;
@@ -235,7 +228,7 @@ BEGIN
         RETURN;
     END IF;
 
-    -- transfer_input[] accepts any number of dimensions; Postgres doesn't enforce them.
+    -- transfers[] accepts any number of dimensions; Postgres doesn't enforce them.
     IF array_ndims(inputs) <> 1 THEN
         RAISE EXCEPTION 'create_transfers expects a one-dimensional array, got % dimensions',
             array_ndims(inputs);
@@ -249,10 +242,11 @@ BEGIN
     -- Phase 1 plus phase 2's lock-free setup, before any lock is taken.
     WITH checks AS (
         -- Phase 1: the first failed check, the row's own values before its lookups.
-        -- 1e39 overflows numeric(39,0) and also catches NaN and Infinity; NULL account ids
-        -- fall through to the not-found checks.
+        -- 1e39 is the range limit, as numeric(39,0), and also catches NaN and Infinity; NULL
+        -- account ids fall through to the not-found checks.
         SELECT t.ord, t.id, t.debit_account_id, t.credit_account_id,
                CASE
+                   WHEN t.timestamp IS NOT NULL THEN 'timestamp_must_not_be_set'
                    WHEN t.id IS NULL THEN 'id_not_set'
                    -- NULL is no cap, allowed only on a balancing transfer.
                    WHEN CASE WHEN t.amount IS NULL
@@ -273,7 +267,7 @@ BEGIN
         FROM unnest(inputs) WITH ORDINALITY
              AS t(id, ledger_id, debit_account_id, credit_account_id,
                   amount, code, external_id, external_timestamp,
-                  balancing_debit, balancing_credit, ord)
+                  balancing_debit, balancing_credit, timestamp, ord)
         -- One index probe per row. As plain joins or an EXISTS, the 10-row unnest estimate
         -- gets hash joins over seq scans of accounts and ledgers and a hashed subplan over
         -- all of transfers; LIMIT 1 keeps each lookup a parameterized subquery.
@@ -380,7 +374,8 @@ BEGIN
         credit_rank := candidate_credit_rank[candidate_index];
         -- Balancing clamps toward zero balance. LEAST ignores NULL, so an uncapped amount
         -- takes the whole available balance.
-        amount      := candidate.amount;
+        -- trunc() drops any trailing zeros (2.0 -> 2); phase 1 ensured a whole number.
+        amount      := trunc(candidate.amount);
         IF candidate.balancing_debit THEN
             amount := LEAST(amount, GREATEST(0, ranked_balances[debit_rank].credits_posted
                                                 - ranked_balances[debit_rank].debits_posted));
@@ -428,17 +423,11 @@ BEGIN
         ranked_balances[credit_rank] := credit_balance;
         id_group_posted[candidate_id_group[candidate_index]] := true;
 
-        new_transfer.id                 := candidate.id;
-        new_transfer.created_at         := clock_timestamp();
-        new_transfer.ledger_id          := candidate.ledger_id;
-        new_transfer.debit_account_id   := candidate.debit_account_id;
-        new_transfer.credit_account_id  := candidate.credit_account_id;
-        new_transfer.amount             := amount;   -- the walk's amount, not the input's
-        new_transfer.code               := candidate.code;
-        new_transfer.external_id        := candidate.external_id;
-        new_transfer.external_timestamp := candidate.external_timestamp;
-        new_transfer.balancing_debit    := COALESCE(candidate.balancing_debit,  false);
-        new_transfer.balancing_credit   := COALESCE(candidate.balancing_credit, false);
+        new_transfer                  := candidate;
+        new_transfer.amount           := amount;   -- the walk's amount, not the input's
+        new_transfer.balancing_debit  := COALESCE(candidate.balancing_debit,  false);
+        new_transfer.balancing_credit := COALESCE(candidate.balancing_credit, false);
+        new_transfer.timestamp        := clock_timestamp();
 
         accepted_count := accepted_count + 1;
         new_transfers[accepted_count]        := new_transfer;
