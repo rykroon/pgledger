@@ -14,7 +14,7 @@ const accountChunk = 1000
 
 type accountRow struct {
 	id           uuid.UUID
-	ledger       uuid.UUID
+	ledger       int32
 	code         int32
 	requireDebit bool
 }
@@ -37,24 +37,19 @@ func parallel(ctx context.Context, n int, fn func(ctx context.Context, i int) er
 	return first
 }
 
-// setupWorld creates the ledgers and accounts for this run and, with -rules, funds every
+// setupWorld creates the accounts for this run and, with -rules, funds every
 // account from its ledger's reserve so the timed run starts from a solvent ledger.
 func setupWorld(ctx context.Context, cfg *config, conns []*pgx.Conn, runID uuid.UUID, rep *report) (*world, error) {
 	w := &world{runID: runID}
 	t0 := time.Now()
 
-	// Ledgers, with zipf weights 1/(rank+1)^skew for -ledger-skew.
-	ledgerIDs := make([]uuid.UUID, cfg.ledgers)
+	// Ledgers 1..N, with zipf weights 1/(rank+1)^skew for -ledger-skew. A ledger is just a
+	// number; there is nothing to create.
 	var total float64
-	for i := range ledgerIDs {
-		ledgerIDs[i] = newID(cfg.uuidVersion)
-		w.ledgers = append(w.ledgers, &ledgerSet{id: ledgerIDs[i]})
+	for i := 0; i < cfg.ledgers; i++ {
+		w.ledgers = append(w.ledgers, &ledgerSet{id: int32(i + 1)})
 		total += 1 / math.Pow(float64(i+1), cfg.ledgerSkew)
 		w.cum = append(w.cum, total)
-	}
-	ledgerSQL := fmt.Sprintf("INSERT INTO %s.ledgers (id) SELECT unnest($1::uuid[])", pgx.Identifier{cfg.schema}.Sanitize())
-	if _, err := conns[0].Exec(ctx, ledgerSQL, ledgerIDs); err != nil {
-		return nil, fmt.Errorf("create ledgers: %w", err)
 	}
 
 	// Accounts: per ledger, hot accounts first, then normal, plus a reserve when -rules.
@@ -91,14 +86,14 @@ func setupWorld(ctx context.Context, cfg *config, conns []*pgx.Conn, runID uuid.
 	accountSQL := fmt.Sprintf(`SELECT count(*) FILTER (WHERE code <> 'ok')
 FROM %s.create_accounts(ARRAY(
     SELECT ROW(a.id, a.ledger, a.code, a.ext, NULL, false, a.require_debit, NULL)::%s.accounts
-    FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::bool[])
+    FROM unnest($1::uuid[], $2::int[], $3::int[], $4::uuid[], $5::bool[])
          AS a(id, ledger, code, ext, require_debit)
 ))`, q, q)
 	err := parallel(ctx, len(conns), func(ctx context.Context, i int) error {
 		for chunk := range chunks {
 			n := len(chunk)
-			ids, ledgers, ext := make([]uuid.UUID, n), make([]uuid.UUID, n), make([]uuid.UUID, n)
-			codes, rules := make([]int32, n), make([]bool, n)
+			ids, ext := make([]uuid.UUID, n), make([]uuid.UUID, n)
+			ledgers, codes, rules := make([]int32, n), make([]int32, n), make([]bool, n)
 			for k, r := range chunk {
 				ids[k], ledgers[k], codes[k], ext[k], rules[k] = r.id, r.ledger, r.code, runID, r.requireDebit
 			}

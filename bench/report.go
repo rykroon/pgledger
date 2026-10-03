@@ -161,7 +161,7 @@ func verify(ctx context.Context, conn *pgx.Conn, schema string, rep *report) err
 		v.Checks = append(v.Checks, check{Name: name, OK: ok, Detail: detail})
 	}
 
-	n, err := count("SELECT count(*) FROM (SELECT ledger_id FROM " + q("current_balances") + " GROUP BY 1 HAVING sum(balance) <> 0) x")
+	n, err := count("SELECT count(*) FROM (SELECT ledger FROM " + q("current_balances") + " GROUP BY 1 HAVING sum(balance) <> 0) x")
 	if err != nil {
 		return err
 	}

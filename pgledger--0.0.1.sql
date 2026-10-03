@@ -8,21 +8,6 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- Stamps timestamp; callers can't supply it. clock_timestamp() gives each row its own time,
--- though not a unique one. Accounts and transfers are stamped by their create functions instead.
-CREATE OR REPLACE FUNCTION @extschema@.set_timestamp()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.timestamp IS NOT NULL THEN
-        RAISE EXCEPTION '%.%.timestamp is assigned by the ledger and cannot be supplied',
-            TG_TABLE_SCHEMA, TG_TABLE_NAME;
-    END IF;
-    NEW.timestamp := clock_timestamp();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-
 -- Only the table's create function, named by the trigger argument, may write. It runs as
 -- SECURITY DEFINER, so its inserts run as the table owner; anyone else granted INSERT is
 -- rejected here. The owner itself is trusted.
@@ -40,28 +25,13 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- Deliberately bare; mutable attributes belong in the caller's own table keyed by ledger_id.
-CREATE TABLE @extschema@.ledgers (
-    id        uuid        PRIMARY KEY,
-    timestamp timestamptz NOT NULL
-);
-
-CREATE INDEX ledgers_timestamp_idx ON @extschema@.ledgers (timestamp);
-
-CREATE TRIGGER ledgers_set_timestamp
-    BEFORE INSERT ON @extschema@.ledgers
-    FOR EACH ROW EXECUTE FUNCTION @extschema@.set_timestamp();
-
-CREATE TRIGGER ledgers_immutable
-    BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.ledgers
-    FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
-
 -- code, external_id and external_timestamp are opaque caller data. Both balance requirements
 -- at once would pin the balance to zero. create_accounts() checks every rule and reports it as
--- a code, and stamps timestamp; the CHECKs and the ledger FK are backstops.
+-- a code, and stamps timestamp; the CHECKs are backstops. ledger is any positive integer the
+-- caller chooses; there is no ledgers table, so a new value simply starts a new ledger.
 CREATE TABLE @extschema@.accounts (
     id                 uuid        PRIMARY KEY,
-    ledger_id          uuid        NOT NULL REFERENCES @extschema@.ledgers(id),
+    ledger             integer     NOT NULL CHECK (ledger > 0),
     code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
     external_id        uuid,
     external_timestamp timestamptz,
@@ -75,11 +45,11 @@ CREATE TABLE @extschema@.accounts (
         CHECK (NOT (require_credit_balance AND require_debit_balance)),
 
     -- Unused since the composite FKs were dropped; kept in case they return.
-    UNIQUE (id, ledger_id)
+    UNIQUE (id, ledger)
 );
 
 CREATE INDEX accounts_timestamp_idx ON @extschema@.accounts (timestamp);
-CREATE INDEX accounts_ledger_id_idx ON @extschema@.accounts (ledger_id);
+CREATE INDEX accounts_ledger_idx ON @extschema@.accounts (ledger);
 CREATE INDEX accounts_code_idx ON @extschema@.accounts (code);
 CREATE INDEX accounts_external_id_idx ON @extschema@.accounts (external_id)
     WHERE external_id IS NOT NULL;
@@ -94,7 +64,7 @@ CREATE TRIGGER accounts_immutable
     BEFORE UPDATE OR DELETE OR TRUNCATE ON @extschema@.accounts
     FOR EACH STATEMENT EXECUTE FUNCTION @extschema@.raise_immutable();
 
--- Value flows credit -> debit. create_transfers() validates accounts and ledgers itself; the
+-- Value flows credit -> debit. create_transfers() validates the ledger and accounts itself; the
 -- CHECKs are backstops. It also stamps timestamp. For a balancing transfer amount is what
 -- actually moved, after the clamp; the flags record that it was one.
 --
@@ -103,7 +73,7 @@ CREATE TRIGGER accounts_immutable
 -- overflow before those checks see it; the CHECK holds the range numeric(39,0) would.
 CREATE TABLE @extschema@.transfers (
     id                 uuid        PRIMARY KEY,
-    ledger_id          uuid        NOT NULL,
+    ledger             integer     NOT NULL CHECK (ledger > 0),
     debit_account_id   uuid        NOT NULL,
     credit_account_id  uuid        NOT NULL,
     amount             numeric     NOT NULL
@@ -122,7 +92,7 @@ CREATE TABLE @extschema@.transfers (
 
 CREATE INDEX transfers_debit_account_id_idx ON @extschema@.transfers (debit_account_id);
 CREATE INDEX transfers_credit_account_id_idx ON @extschema@.transfers (credit_account_id);
-CREATE INDEX transfers_ledger_id_timestamp_idx ON @extschema@.transfers (ledger_id, timestamp);
+CREATE INDEX transfers_ledger_timestamp_idx ON @extschema@.transfers (ledger, timestamp);
 CREATE INDEX transfers_timestamp_idx ON @extschema@.transfers (timestamp);
 CREATE INDEX transfers_code_idx ON @extschema@.transfers (code);
 CREATE INDEX transfers_external_id_idx ON @extschema@.transfers (external_id)
@@ -168,9 +138,9 @@ REVOKE INSERT ON @extschema@.accounts, @extschema@.transfers, @extschema@.accoun
 
 -- One row of create_accounts()'s result, in input order. code is 'ok' or the first failed
 -- check:
---   values:        timestamp_must_not_be_set, id_not_set, code_invalid,
+--   values:        timestamp_must_not_be_set, id_not_set, ledger_invalid, code_invalid,
 --                  flags_are_mutually_exclusive (both balance requirements set)
---   relationships: id_already_exists, ledger_not_found
+--   relationships: id_already_exists
 CREATE TYPE @extschema@.account_result AS (
     ord        integer,
     account_id uuid,
@@ -197,27 +167,24 @@ BEGIN
 
     RETURN QUERY
     WITH checks AS (
-        -- The first failed check, the row's own values before its lookups. A NULL ledger_id
-        -- falls through to ledger_not_found.
+        -- The first failed check, the row's own values before its lookup.
         SELECT t.*,
                CASE
                    WHEN t.timestamp IS NOT NULL THEN 'timestamp_must_not_be_set'
                    WHEN t.id IS NULL THEN 'id_not_set'
+                   WHEN t.ledger IS NULL OR t.ledger <= 0 THEN 'ledger_invalid'
                    WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
                    WHEN t.require_credit_balance AND t.require_debit_balance
                        THEN 'flags_are_mutually_exclusive'
                    WHEN a.id IS NOT NULL THEN 'id_already_exists'
-                   WHEN l.id IS NULL THEN 'ledger_not_found'
                END AS fail
         -- ORDINALITY counts from 1 whatever the array's lower bound, so no rebase is needed.
         FROM unnest(inputs) WITH ORDINALITY
-             AS t(id, ledger_id, code, external_id, external_timestamp,
+             AS t(id, ledger, code, external_id, external_timestamp,
                   require_credit_balance, require_debit_balance, timestamp, ord)
         -- One index probe per row; see create_transfers() for why LIMIT 1.
         LEFT JOIN LATERAL (SELECT a.id FROM @extschema@.accounts a
                            WHERE a.id = t.id LIMIT 1) a ON true
-        LEFT JOIN LATERAL (SELECT l.id FROM @extschema@.ledgers l
-                           WHERE l.id = t.ledger_id LIMIT 1) l ON true
     ),
     -- Repeats within the batch, counted only among rows that passed, so a rejected first copy
     -- doesn't block a later one.
@@ -232,7 +199,7 @@ BEGIN
     ),
     insert_accounts AS (
         INSERT INTO @extschema@.accounts
-        SELECT r.id, r.ledger_id, r.code, r.external_id, r.external_timestamp,
+        SELECT r.id, r.ledger, r.code, r.external_id, r.external_timestamp,
                COALESCE(r.require_credit_balance, false),
                COALESCE(r.require_debit_balance,  false),
                clock_timestamp()
@@ -253,9 +220,9 @@ SET plan_cache_mode = force_generic_plan;
 
 -- One row of create_transfers()'s result, in input order. code is 'ok' or the first failed
 -- check:
---   values:        timestamp_must_not_be_set, id_not_set, amount_must_be_positive,
---                  code_invalid, accounts_must_be_different
---   relationships: id_already_exists, ledger_not_found, debit_account_not_found,
+--   values:        timestamp_must_not_be_set, id_not_set, ledger_invalid,
+--                  amount_must_be_positive, code_invalid, accounts_must_be_different
+--   relationships: id_already_exists, debit_account_not_found,
 --                  credit_account_not_found, debit_account_ledger_mismatch,
 --                  credit_account_ledger_mismatch
 --   balances:      exceeds_credits, exceeds_debits (also a balancing transfer that would move
@@ -337,6 +304,7 @@ BEGIN
                CASE
                    WHEN t.timestamp IS NOT NULL THEN 'timestamp_must_not_be_set'
                    WHEN t.id IS NULL THEN 'id_not_set'
+                   WHEN t.ledger IS NULL OR t.ledger <= 0 THEN 'ledger_invalid'
                    -- NULL is no cap, allowed only on a balancing transfer.
                    WHEN CASE WHEN t.amount IS NULL
                              THEN NOT (t.balancing_debit IS TRUE OR t.balancing_credit IS TRUE)
@@ -347,26 +315,23 @@ BEGIN
                    WHEN t.debit_account_id = t.credit_account_id
                        THEN 'accounts_must_be_different'
                    WHEN tx.id  IS NOT NULL THEN 'id_already_exists'
-                   WHEN l.id  IS NULL THEN 'ledger_not_found'
                    WHEN da.id IS NULL THEN 'debit_account_not_found'
                    WHEN ca.id IS NULL THEN 'credit_account_not_found'
-                   WHEN da.ledger_id <> t.ledger_id THEN 'debit_account_ledger_mismatch'
-                   WHEN ca.ledger_id <> t.ledger_id THEN 'credit_account_ledger_mismatch'
+                   WHEN da.ledger <> t.ledger THEN 'debit_account_ledger_mismatch'
+                   WHEN ca.ledger <> t.ledger THEN 'credit_account_ledger_mismatch'
                END AS fail
         FROM unnest(inputs) WITH ORDINALITY
-             AS t(id, ledger_id, debit_account_id, credit_account_id,
+             AS t(id, ledger, debit_account_id, credit_account_id,
                   amount, code, external_id, external_timestamp,
                   balancing_debit, balancing_credit, timestamp, ord)
         -- One index probe per row. As plain joins or an EXISTS, the 10-row unnest estimate
-        -- gets hash joins over seq scans of accounts and ledgers and a hashed subplan over
+        -- gets hash joins over seq scans of accounts and a hashed subplan over
         -- all of transfers; LIMIT 1 keeps each lookup a parameterized subquery.
         LEFT JOIN LATERAL (SELECT tx.id FROM @extschema@.transfers tx
                            WHERE tx.id = t.id LIMIT 1) tx ON true
-        LEFT JOIN LATERAL (SELECT l.id FROM @extschema@.ledgers l
-                           WHERE l.id = t.ledger_id LIMIT 1) l ON true
-        LEFT JOIN LATERAL (SELECT a.id, a.ledger_id FROM @extschema@.accounts a
+        LEFT JOIN LATERAL (SELECT a.id, a.ledger FROM @extschema@.accounts a
                            WHERE a.id = t.debit_account_id LIMIT 1) da ON true
-        LEFT JOIN LATERAL (SELECT a.id, a.ledger_id FROM @extschema@.accounts a
+        LEFT JOIN LATERAL (SELECT a.id, a.ledger FROM @extschema@.accounts a
                            WHERE a.id = t.credit_account_id LIMIT 1) ca ON true
     ),
     candidates AS (
@@ -548,7 +513,7 @@ SET plan_cache_mode = force_generic_plan;
 CREATE VIEW @extschema@.current_balances AS
 SELECT
     a.id        AS account_id,
-    a.ledger_id,
+    a.ledger,
     COALESCE(b.version,        0) AS version,
     COALESCE(b.debits_posted,  0) AS debits_posted,
     COALESCE(b.credits_posted, 0) AS credits_posted,

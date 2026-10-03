@@ -3,7 +3,7 @@
 A double-entry ledger for Postgres, inspired by [TigerBeetle](https://tigerbeetle.com/).
 
 Every transfer moves value from a credit account to a debit account, and both sides are
-recorded. Nothing is ever updated or deleted — ledgers, accounts, transfers, and balances are all append-only, so the full history stays readable.
+recorded. Nothing is ever updated or deleted — accounts, transfers, and balances are all append-only, so the full history stays readable.
 
 ## Install
 
@@ -24,63 +24,72 @@ A ledger holds accounts in a single unit of value, such as a currency, points, o
 The extension doesn't dictate how you structure them: you tell accounts apart with your own
 `code`s and `external_id`, and choose a balance rule for each one.
 
-Create a ledger:
-
-```sql
-INSERT INTO ledger.ledgers (id) VALUES ('...ledger-id...');
-```
-
-`ledger.ledgers` is intentionally bare. Keep mutable attributes such as a name in your own
-table keyed by `ledger_id uuid PRIMARY KEY REFERENCES ledger.ledgers(id)`.
+A ledger is just a positive integer you choose, like TigerBeetle's `ledger`; there is
+nothing to create, and the first account that uses a number starts that ledger. Keep
+attributes such as a name or currency in your own table keyed by `ledger integer`.
 
 Create accounts with `ledger.create_accounts()`, which takes an array of `ledger.accounts`
 rows with `timestamp` left `NULL`. Each account may optionally restrict which side its
-balance can be on. The fields are `id, ledger_id, code, external_id, external_timestamp,
+balance can be on. The fields are `id, ledger, code, external_id, external_timestamp,
 require_credit_balance, require_debit_balance, timestamp`:
 
 ```sql
 SELECT * FROM ledger.create_accounts(ARRAY[
     -- cash (code 1 in this example): debit-normal, cannot go below zero
-    ROW('...cash-id...', '...ledger-id...', 1, NULL, NULL, false, true, NULL)::ledger.accounts,
+    ROW('...cash-id...', 1, 1, NULL, NULL, false, true, NULL)::ledger.accounts,
     -- revenue (code 2): credit-normal, cannot go below zero
-    ROW('...revenue-id...', '...ledger-id...', 2, NULL, NULL, true, false, NULL)::ledger.accounts
+    ROW('...revenue-id...', 1, 2, NULL, NULL, true, false, NULL)::ledger.accounts
 ]);
 ```
 
 It returns one `(ord, account_id, code)` row per input, in input order. `code` is `ok` or the
-first failed check: `timestamp_must_not_be_set`, `id_not_set`, `code_invalid`,
-`flags_are_mutually_exclusive` (both balance requirements set), `id_already_exists`, or
-`ledger_not_found`. A rejected row doesn't stop the others from being created, and a `NULL`
+first failed check: `timestamp_must_not_be_set`, `id_not_set`, `ledger_invalid`,
+`code_invalid`, `flags_are_mutually_exclusive` (both balance requirements set), or
+`id_already_exists`. A rejected row doesn't stop the others from being created, and a `NULL`
 balance requirement counts as `false`. When an id appears more than once in a batch, only
 its first valid copy is created. A retry is safe: accounts that already exist come back as
 `id_already_exists`.
 
-Post a transfer. Value flows credit -> debit, so recording a sale debits cash and credits
-revenue:
+Post transfers with `ledger.create_transfers()`, which takes an array of `ledger.transfers`
+rows with `timestamp` left `NULL`. The fields are `id, ledger, debit_account_id,
+credit_account_id, amount, code, external_id, external_timestamp, balancing_debit,
+balancing_credit, timestamp`. Value flows credit -> debit, so recording a sale debits cash
+and credits revenue:
 
 ```sql
-INSERT INTO ledger.transfers (id, ledger_id, debit_account_id, credit_account_id, amount, code)
-VALUES ('...transfer-id...', '...ledger-id...', '...cash-id...', '...revenue-id...', 100, 1);
+SELECT * FROM ledger.create_transfers(ARRAY[
+    ROW('...transfer-id...', 1, '...cash-id...', '...revenue-id...',
+        100, 1, NULL, NULL, false, false, NULL)::ledger.transfers
+]);
 ```
 
-A trigger posts the transfer, appends the new running totals to `ledger.account_balances`,
-and enforces the balance rules. A multi-row `INSERT` posts every row, and a failure anywhere
-rolls back the whole statement. A batch may span ledgers. Rows post in `timestamp` order,
-which in practice is the order the statement produced them, but Postgres doesn't guarantee
-that order, so don't rely on it.
+It returns one `(ord, transfer_id, code)` row per input, in input order. `code` is `ok` or the
+first failed check:
 
-When one transfer must post before the next, insert them in separate statements in one
-transaction. Order changes outcomes: a deposit followed by a withdrawal can succeed where
-the reverse fails. Posting across several statements carries a deadlock caveat, covered
-under [Concurrency](#concurrency).
+- the row's own values: `timestamp_must_not_be_set`, `id_not_set`, `ledger_invalid`,
+  `amount_must_be_positive`, `code_invalid`, `accounts_must_be_different`
+- lookups: `id_already_exists`, `debit_account_not_found`, `credit_account_not_found`,
+  `debit_account_ledger_mismatch`, `credit_account_ledger_mismatch`
+- balances: `exceeds_credits`, `exceeds_debits`
 
-A retry is safe with `ON CONFLICT (id) DO NOTHING`: rows that already exist are skipped
-and never posted twice.
+Each accepted transfer is inserted into `ledger.transfers` with two new running-total rows in
+`ledger.account_balances`. A rejected row doesn't stop the others from posting, and a `NULL`
+balancing flag counts as `false`. A batch may span ledgers.
+
+Rows post in input order, each against the balances left by the accepted rows before it, so
+order changes outcomes: a deposit followed by a withdrawal can succeed where the reverse is
+rejected. A rejected row never affects the rows after it. To post all-or-nothing, check the
+results and roll back the transaction if any row isn't `ok`.
+
+A retry is safe: transfers that already exist come back as `id_already_exists` and are never
+posted twice. When an id appears more than once in a batch, it posts at most once. If two
+concurrent calls post the same new id, the later one fails as a whole with a unique
+violation (SQLSTATE `23505`); retrying it then reports `id_already_exists`.
 
 Read balances:
 
 ```sql
-SELECT account_id, balance FROM ledger.current_balances WHERE ledger_id = '...ledger-id...';
+SELECT account_id, balance FROM ledger.current_balances WHERE ledger = 1;
 ```
 
 `balance` is debits minus credits, so debit-normal accounts read positive and credit-normal
@@ -105,7 +114,9 @@ ORDER BY ab.version;
 - `require_credit_balance`: the account's debits may never exceed its credits.
 - Neither: the balance may be on either side.
 
-A transfer that would break a rule is rejected and the whole statement rolls back.
+A transfer that would break a rule is rejected with `exceeds_credits` (its debit account
+requires a credit balance) or `exceeds_debits` (its credit account requires a debit
+balance). The debit account is checked first. The rest of the batch still posts.
 
 ## Balancing transfers
 
@@ -123,7 +134,7 @@ credit-normal wallet holds:
 
 ```sql
 SELECT * FROM ledger.create_transfers(ARRAY[
-    ROW('...transfer-id...', '...ledger-id...', '...wallet-id...', '...cash-id...',
+    ROW('...transfer-id...', 1, '...wallet-id...', '...cash-id...',
         NULL, 3, NULL, NULL, true, false, NULL)::ledger.transfers
 ]);
 ```
@@ -149,7 +160,7 @@ them but never interprets them:
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
   date or the original time of an imported record. It doesn't change the order balances
   are applied in. `timestamp` is always set by the ledger, never by you, to the clock time
-  the row was inserted. Rows get their own times, even within one statement, but it is not
+  the row was inserted. Rows get their own times, even within one batch, but it is not
   unique: two rows can share a microsecond.
 
 Transfers have no total order. Within one account, `ledger.account_balances.version` is the
@@ -160,20 +171,20 @@ across accounts it can disagree with the order transactions commit in.
 
 ## Concurrency
 
-Posting locks every account the statement touches, in `id` order, until the transaction
-ends. Two transactions never post to the same account at once, which is what keeps `version`
-gapless and the balance rules honest. Transfers on disjoint accounts post in parallel, and
-creating accounts is never blocked.
+Each `create_transfers()` call locks every account its batch touches, in `id` order, until
+the transaction ends. Two transactions never post to the same account at once, which is what
+keeps `version` gapless and the balance rules honest. Transfers on disjoint accounts post in
+parallel, and creating accounts is never blocked.
 
-Because the locks are taken in `id` order, two concurrent statements that touch the same
-accounts cannot deadlock, however their rows are ordered. That guarantee covers a single
-statement only. A transaction that posts in several statements accumulates locks in statement
-order, so two transactions reaching the same accounts through separate statements, in
-opposite order, can deadlock and one will be rolled back with SQLSTATE `40P01`.
+Because the locks are taken in `id` order, two concurrent calls that touch the same accounts
+cannot deadlock, however their rows are ordered. That guarantee covers a single call only. A
+transaction that calls `create_transfers()` several times accumulates locks call by call, so
+two transactions reaching the same accounts through separate calls, in opposite order, can
+deadlock and one will be rolled back with SQLSTATE `40P01`.
 
-This matters whenever transfers must be ordered, because ordering them means separate
-statements. Lock every account the transaction will touch up front, in `id` order, before
-the first `INSERT`:
+Prefer one call per transaction; a batch already posts in input order. When a transaction
+must post in several calls, lock every account it will touch up front, in `id` order, before
+the first call:
 
 ```sql
 SELECT id FROM ledger.accounts
@@ -187,12 +198,11 @@ transaction already holds and never acquires one out of order.
 
 ## Constraints
 
-- Accounts must belong to an existing ledger.
+- `ledger` must be a positive integer.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
 - `amount` must be positive. It may be `NULL` (no cap) only on a balancing transfer.
 - `code` must be positive.
-- `timestamp` is assigned by the ledger; supplying it is rejected (`timestamp_must_not_be_set`
-  on an account or transfer, an error on a ledger).
+- `timestamp` is assigned by the ledger; supplying it is rejected (`timestamp_must_not_be_set`).
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected.

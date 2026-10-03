@@ -1,7 +1,7 @@
 // pgledger-bench measures posting throughput of the pgledger extension.
 //
 // By default it starts a throwaway supabase/postgres container, installs the working-tree
-// extension through pg_tle, creates ledgers and accounts, posts transfers from N concurrent
+// extension through pg_tle, creates accounts across ledgers, posts transfers from N concurrent
 // clients, reports throughput and latency, verifies the ledger, and removes the container.
 package main
 

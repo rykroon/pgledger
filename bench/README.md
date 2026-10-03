@@ -11,7 +11,7 @@ and removes the container. Requires Docker and Go.
 cd bench
 go run .                                   # 8 clients, 1 ledger, 1000 accounts, 100k transfers
 go run . -clients 32 -accounts 10 -hot-ratio 1   # lock contention on one hot account
-go run . -batch 100 -transfers 1000000     # one INSERT per 100 transfers
+go run . -batch 100 -transfers 1000000     # one create_transfers() call per 100 transfers
 go run . -rules -fund 1000 -amount-max 5000     # balance rules with rejections
 go run . -ledgers 8 -ledger-skew 1.2 -json # traffic concentrated on a few ledgers, JSON out
 ```
@@ -22,7 +22,7 @@ go run . -ledgers 8 -ledger-skew 1.2 -json # traffic concentrated on a few ledge
 |---|---|---|
 | `-clients` | 8 | concurrent connections, one goroutine each; every statement is its own transaction |
 | `-transfers` | 100000 | transfers in the timed run, split evenly across clients |
-| `-batch` | 1 | transfers per `INSERT`. The trigger locks the touched accounts and runs once per statement, so this is the main lever |
+| `-batch` | 1 | transfers per `create_transfers()` call. Each call locks the accounts it touches and runs once per batch, so this is the main lever |
 | `-ledgers` | 1 | ledgers; accounts are split evenly across them |
 | `-ledger-skew` | 0 | zipf exponent for choosing a transfer's ledger. 0 is uniform; 1 or more piles traffic onto the first ledgers |
 | `-accounts` | 1000 | total accounts across all ledgers |

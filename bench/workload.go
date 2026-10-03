@@ -23,7 +23,7 @@ const (
 )
 
 type ledgerSet struct {
-	id      uuid.UUID
+	id      int32
 	all     []uuid.UUID // hot accounts first, then normal
 	hot     []uuid.UUID
 	normal  []uuid.UUID
@@ -37,9 +37,10 @@ type world struct {
 }
 
 type transfer struct {
-	id, ledger, debit, credit uuid.UUID
-	amount                    int64
-	code                      int32
+	id, debit, credit uuid.UUID
+	ledger            int32
+	amount            int64
+	code              int32
 }
 
 func newID(version string) uuid.UUID {
@@ -114,7 +115,7 @@ func insertSQL(schema string) string {
 	return fmt.Sprintf(`SELECT count(*) FILTER (WHERE code <> 'ok')
 FROM %s.create_transfers(ARRAY(
     SELECT ROW(t.id, t.ledger, t.debit, t.credit, t.amount, t.code, t.ext, NULL, NULL, NULL, NULL)::%s.transfers
-    FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[], $5::numeric[], $6::int[], $7::uuid[])
+    FROM unnest($1::uuid[], $2::int[], $3::uuid[], $4::uuid[], $5::numeric[], $6::int[], $7::uuid[])
          AS t(id, ledger, debit, credit, amount, code, ext)
 ))`, q, q)
 }
@@ -122,7 +123,7 @@ FROM %s.create_transfers(ARRAY(
 func postBatch(ctx context.Context, conn *pgx.Conn, sql string, batch []transfer, runID uuid.UUID) (int64, error) {
 	n := len(batch)
 	ids := make([]uuid.UUID, n)
-	ledgers := make([]uuid.UUID, n)
+	ledgers := make([]int32, n)
 	debits := make([]uuid.UUID, n)
 	credits := make([]uuid.UUID, n)
 	amounts := make([]int64, n)
