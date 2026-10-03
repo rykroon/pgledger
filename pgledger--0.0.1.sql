@@ -70,14 +70,16 @@ CREATE TRIGGER accounts_immutable
 --
 -- The row type is also create_transfers()'s input, where every rule is checked and reported
 -- as a code. amount is plain numeric so that a cast into this type can't round a fraction or
--- overflow before those checks see it; the CHECK holds the range numeric(39,0) would.
+-- overflow before those checks see it. Amounts and running totals are capped at TigerBeetle's
+-- u128 (2^128 - 1) so that every row can be exported to it.
 CREATE TABLE @extschema@.transfers (
     id                 uuid        PRIMARY KEY,
     ledger             integer     NOT NULL CHECK (ledger > 0),
     debit_account_id   uuid        NOT NULL,
     credit_account_id  uuid        NOT NULL,
     amount             numeric     NOT NULL
-        CHECK (amount > 0 AND amount = trunc(amount) AND amount < 1e39),
+        CHECK (amount > 0 AND amount = trunc(amount)
+               AND amount <= 340282366920938463463374607431768211455),
     code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
     external_id        uuid,
     external_timestamp timestamptz,
@@ -114,8 +116,10 @@ CREATE TABLE @extschema@.account_balances (
     account_id     uuid          NOT NULL,
     version        bigint        NOT NULL CHECK (version > 0),
     transfer_id    uuid          NOT NULL,
-    debits_posted  numeric(39,0) NOT NULL CHECK (debits_posted >= 0),
-    credits_posted numeric(39,0) NOT NULL CHECK (credits_posted >= 0),
+    debits_posted  numeric(39,0) NOT NULL
+        CHECK (debits_posted  BETWEEN 0 AND 340282366920938463463374607431768211455),
+    credits_posted numeric(39,0) NOT NULL
+        CHECK (credits_posted BETWEEN 0 AND 340282366920938463463374607431768211455),
 
     PRIMARY KEY (account_id, version),
     UNIQUE (transfer_id, account_id)
@@ -225,8 +229,10 @@ SET plan_cache_mode = force_generic_plan;
 --   relationships: id_already_exists, debit_account_not_found,
 --                  credit_account_not_found, debit_account_ledger_mismatch,
 --                  credit_account_ledger_mismatch
---   balances:      exceeds_credits, exceeds_debits (also a balancing transfer that would move
---                  nothing: exceeds_credits if the debit side is balancing and already at zero)
+--   balances:      overflows_debits_posted, overflows_credits_posted (a running total would
+--                  pass 2^128 - 1), exceeds_credits, exceeds_debits (also a balancing transfer
+--                  that would move nothing: exceeds_credits if the debit side is balancing and
+--                  already at zero)
 CREATE TYPE @extschema@.transfer_result AS (
     ord         integer,
     transfer_id uuid,
@@ -279,6 +285,9 @@ DECLARE
     debit_balance   @extschema@.account_balances;
     credit_balance  @extschema@.account_balances;
     new_transfer    @extschema@.transfers;
+
+    -- TigerBeetle's u128 limit, for amounts and running totals.
+    u128_max CONSTANT numeric := 340282366920938463463374607431768211455;
 BEGIN
     IF inputs IS NULL OR cardinality(inputs) = 0 THEN
         RETURN;
@@ -298,8 +307,8 @@ BEGIN
     -- Phase 1 plus phase 2's lock-free setup, before any lock is taken.
     WITH checks AS (
         -- Phase 1: the first failed check, the row's own values before its lookups.
-        -- 1e39 is the range limit, as numeric(39,0), and also catches NaN and Infinity; NULL
-        -- account ids fall through to the not-found checks.
+        -- u128_max is the range limit and also catches NaN and Infinity, which sort above
+        -- it; NULL account ids fall through to the not-found checks.
         SELECT t.ord, t.id, t.debit_account_id, t.credit_account_id,
                CASE
                    WHEN t.timestamp IS NOT NULL THEN 'timestamp_must_not_be_set'
@@ -308,7 +317,7 @@ BEGIN
                    -- NULL is no cap, allowed only on a balancing transfer.
                    WHEN CASE WHEN t.amount IS NULL
                              THEN NOT (t.balancing_debit IS TRUE OR t.balancing_credit IS TRUE)
-                             ELSE t.amount <= 0 OR t.amount <> trunc(t.amount) OR t.amount >= 1e39
+                             ELSE t.amount <= 0 OR t.amount <> trunc(t.amount) OR t.amount > u128_max
                         END
                        THEN 'amount_must_be_positive'
                    WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
@@ -456,6 +465,15 @@ BEGIN
         credit_balance := ranked_balances[credit_rank];
         debit_balance.debits_posted   := debit_balance.debits_posted   + amount;
         credit_balance.credits_posted := credit_balance.credits_posted + amount;
+
+        -- Overflow before the balance rules, debit account first, as in TigerBeetle.
+        IF debit_balance.debits_posted > u128_max THEN
+            results[ord].code := 'overflows_debits_posted';
+            CONTINUE;
+        ELSIF credit_balance.credits_posted > u128_max THEN
+            results[ord].code := 'overflows_credits_posted';
+            CONTINUE;
+        END IF;
 
         -- Each side can break only one rule; the debit account is checked first, as in
         -- TigerBeetle.

@@ -70,7 +70,8 @@ first failed check:
   `amount_must_be_positive`, `code_invalid`, `accounts_must_be_different`
 - lookups: `id_already_exists`, `debit_account_not_found`, `credit_account_not_found`,
   `debit_account_ledger_mismatch`, `credit_account_ledger_mismatch`
-- balances: `exceeds_credits`, `exceeds_debits`
+- balances: `overflows_debits_posted`, `overflows_credits_posted` (the transfer would push an
+  account's running total past 2^128 − 1), `exceeds_credits`, `exceeds_debits`
 
 Each accepted transfer is inserted into `ledger.transfers` with two new running-total rows in
 `ledger.account_balances`. A rejected row doesn't stop the others from posting, and a `NULL`
@@ -200,8 +201,10 @@ transaction already holds and never acquires one out of order.
 
 - `ledger` must be a positive integer.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
-- `amount` must be positive. It may be `NULL` (no cap) only on a balancing transfer.
-- `code` must be positive.
+- `amount` must be a positive whole number no greater than 2^128 − 1, TigerBeetle's u128
+  limit, and each account's `debits_posted` and `credits_posted` are capped there too. It may
+  be `NULL` (no cap) only on a balancing transfer.
+- `code` must be between 1 and 65535 (TigerBeetle's u16).
 - `timestamp` is assigned by the ledger; supplying it is rejected (`timestamp_must_not_be_set`).
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
