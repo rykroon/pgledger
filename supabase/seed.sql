@@ -6,9 +6,9 @@
 -- Direct INSERTs into ledger.accounts are rejected; accounts go through create_accounts().
 SELECT * FROM ledger.create_accounts(ARRAY[
     ROW('22222222-2222-2222-2222-222222222222',
-        1, 1, NULL, NULL, false, true, NULL)::ledger.accounts,
+        1, 1, NULL, NULL, false, true)::ledger.account_input,
     ROW('33333333-3333-3333-3333-333333333333',
-        1, 2, NULL, NULL, true, false, NULL)::ledger.accounts
+        1, 2, NULL, NULL, true, false)::ledger.account_input
 ]);
 
 -- A sale: value flows credit -> debit, so cash is debited and revenue credited.
@@ -17,5 +17,5 @@ SELECT * FROM ledger.create_transfers(ARRAY[
     ROW('44444444-4444-4444-4444-444444444444',
         1,
         '22222222-2222-2222-2222-222222222222',
-        '33333333-3333-3333-3333-333333333333', 100, 1, NULL, NULL, NULL, NULL, NULL)::ledger.transfers
+        '33333333-3333-3333-3333-333333333333', 100, 1, NULL, NULL, NULL, NULL)::ledger.transfer_input
 ]);

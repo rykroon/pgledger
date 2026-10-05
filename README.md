@@ -28,46 +28,45 @@ A ledger is just a positive integer you choose, like TigerBeetle's `ledger`; the
 nothing to create, and the first account that uses a number starts that ledger. Keep
 attributes such as a name or currency in your own table keyed by `ledger integer`.
 
-Create accounts with `ledger.create_accounts()`, which takes an array of `ledger.accounts`
-rows with `timestamp` left `NULL`. Each account may optionally restrict which side its
-balance can be on. The fields are `id, ledger, code, external_id, external_timestamp,
-require_credit_balance, require_debit_balance, timestamp`:
+Create accounts with `ledger.create_accounts()`, which takes an array of
+`ledger.account_input`. Each account may optionally restrict which side its balance can be
+on. The fields are `id, ledger, code, external_id, external_timestamp,
+require_credit_balance, require_debit_balance`:
 
 ```sql
 SELECT * FROM ledger.create_accounts(ARRAY[
     -- cash (code 1 in this example): debit-normal, cannot go below zero
-    ROW('...cash-id...', 1, 1, NULL, NULL, false, true, NULL)::ledger.accounts,
+    ROW('...cash-id...', 1, 1, NULL, NULL, false, true)::ledger.account_input,
     -- revenue (code 2): credit-normal, cannot go below zero
-    ROW('...revenue-id...', 1, 2, NULL, NULL, true, false, NULL)::ledger.accounts
+    ROW('...revenue-id...', 1, 2, NULL, NULL, true, false)::ledger.account_input
 ]);
 ```
 
 It returns one `(ord, account_id, code)` row per input, in input order. `code` is `ok` or the
-first failed check: `timestamp_must_not_be_set`, `id_not_set`, `ledger_invalid`,
-`code_invalid`, `flags_are_mutually_exclusive` (both balance requirements set), or
+first failed check: `id_not_set`, `ledger_invalid`, `code_invalid`,
+`flags_are_mutually_exclusive` (both balance requirements set), or
 `id_already_exists`. A rejected row doesn't stop the others from being created, and a `NULL`
 balance requirement counts as `false`. When an id appears more than once in a batch, only
 its first valid copy is created. A retry is safe: accounts that already exist come back as
 `id_already_exists`.
 
-Post transfers with `ledger.create_transfers()`, which takes an array of `ledger.transfers`
-rows with `timestamp` left `NULL`. The fields are `id, ledger, debit_account_id,
-credit_account_id, amount, code, external_id, external_timestamp, balancing_debit,
-balancing_credit, timestamp`. Value flows credit -> debit, so recording a sale debits cash
+Post transfers with `ledger.create_transfers()`, which takes an array of
+`ledger.transfer_input`. The fields are `id, ledger, debit_account_id, credit_account_id,
+amount, code, external_id, external_timestamp, balancing_debit, balancing_credit`. Value flows credit -> debit, so recording a sale debits cash
 and credits revenue:
 
 ```sql
 SELECT * FROM ledger.create_transfers(ARRAY[
     ROW('...transfer-id...', 1, '...cash-id...', '...revenue-id...',
-        100, 1, NULL, NULL, false, false, NULL)::ledger.transfers
+        100, 1, NULL, NULL, false, false)::ledger.transfer_input
 ]);
 ```
 
 It returns one `(ord, transfer_id, code)` row per input, in input order. `code` is `ok` or the
 first failed check:
 
-- the row's own values: `timestamp_must_not_be_set`, `id_not_set`, `ledger_invalid`,
-  `amount_must_be_positive`, `code_invalid`, `accounts_must_be_different`
+- the row's own values: `id_not_set`, `ledger_invalid`, `amount_must_be_positive`,
+  `code_invalid`, `accounts_must_be_different`
 - lookups: `id_already_exists`, `debit_account_not_found`, `credit_account_not_found`,
   `debit_account_ledger_mismatch`, `credit_account_ledger_mismatch`
 - balances: `exceeds_credits`, `exceeds_debits`
@@ -98,10 +97,10 @@ sums to zero.
 
 For history, `ledger.account_balances` has one row per account per transfer, holding the
 running `debits_posted` and `credits_posted` after that transfer. `version` counts each
-account's postings from 1 and is their order; join `ledger.transfers` for timestamps:
+account's postings from 1 and is their order; join `ledger.transfers` for `created_at`:
 
 ```sql
-SELECT ab.version, ab.debits_posted - ab.credits_posted AS balance, t.timestamp
+SELECT ab.version, ab.debits_posted - ab.credits_posted AS balance, t.created_at
 FROM ledger.account_balances ab
 JOIN ledger.transfers t ON t.id = ab.transfer_id
 WHERE ab.account_id = '...cash-id...'
@@ -135,7 +134,7 @@ credit-normal wallet holds:
 ```sql
 SELECT * FROM ledger.create_transfers(ARRAY[
     ROW('...transfer-id...', 1, '...wallet-id...', '...cash-id...',
-        NULL, 3, NULL, NULL, true, false, NULL)::ledger.transfers
+        NULL, 3, NULL, NULL, true, false)::ledger.transfer_input
 ]);
 ```
 
@@ -154,18 +153,18 @@ them but never interprets them:
 
 - `code` (required, a number from 1 to 99999): a category you define, such as a 5-digit
   chart-of-accounts number or a transfer kind (sale, refund, fee). It doesn't reference any
-  table. A fraction is rounded, and 100000 or more fails the whole call.
+  table. Anything else, including a fraction, is rejected with `code_invalid`.
 - `external_id` (optional `uuid`): links the row to something in your system, e.g. a
   customer, an order, or a group of related transfers.
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
   date or the original time of an imported record. It doesn't change the order balances
-  are applied in. `timestamp` is always set by the ledger, never by you, to the clock time
+  are applied in. `created_at` is always set by the ledger, never by you, to the clock time
   the row was inserted. Rows get their own times, even within one batch, but it is not
   unique: two rows can share a microsecond.
 
 Transfers have no total order. Within one account, `ledger.account_balances.version` is the
-order of record. Across a ledger there is none, so order a transfer log by `timestamp, id`
-for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `timestamp` is
+order of record. Across a ledger there is none, so order a transfer log by `created_at, id`
+for a stable result, bearing in mind that `id` is an arbitrary tiebreak. `created_at` is
 taken while posting holds the account locks, so within one account it follows `version`, but
 across accounts it can disagree with the order transactions commit in.
 
@@ -202,7 +201,7 @@ transaction already holds and never acquires one out of order.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
 - `amount` must be positive. It may be `NULL` (no cap) only on a balancing transfer.
 - `code` must be from 1 to 99999.
-- `timestamp` is assigned by the ledger; supplying it is rejected (`timestamp_must_not_be_set`).
+- `created_at` is assigned by the ledger; the input types have no such field.
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
 - Any `UPDATE`, `DELETE`, or `TRUNCATE` on the ledger tables is rejected.

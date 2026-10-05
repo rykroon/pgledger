@@ -85,7 +85,7 @@ func setupWorld(ctx context.Context, cfg *config, conns []*pgx.Conn, runID uuid.
 	q := pgx.Identifier{cfg.schema}.Sanitize()
 	accountSQL := fmt.Sprintf(`SELECT count(*) FILTER (WHERE code <> 'ok')
 FROM %s.create_accounts(ARRAY(
-    SELECT ROW(a.id, a.ledger, a.code, a.ext, NULL, false, a.require_debit, NULL)::%s.accounts
+    SELECT ROW(a.id, a.ledger, a.code, a.ext, NULL, false, a.require_debit)::%s.account_input
     FROM unnest($1::uuid[], $2::int[], $3::int[], $4::uuid[], $5::bool[])
          AS a(id, ledger, code, ext, require_debit)
 ))`, q, q)
