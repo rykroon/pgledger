@@ -29,10 +29,12 @@ $$ LANGUAGE plpgsql;
 -- at once would pin the balance to zero. create_accounts() checks every rule and reports it as
 -- a code, and stamps timestamp; the CHECKs are backstops. ledger is any positive integer the
 -- caller chooses; there is no ledgers table, so a new value simply starts a new ledger.
+-- code fits a 5-digit chart of accounts, wider than TigerBeetle's u16; a cast into this type
+-- rounds a fraction and rejects 100000 or more before create_accounts() sees it.
 CREATE TABLE @extschema@.accounts (
     id                 uuid        PRIMARY KEY,
     ledger             integer     NOT NULL CHECK (ledger > 0),
-    code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
+    code               numeric(5,0) NOT NULL CHECK (code BETWEEN 1 AND 99999),
     external_id        uuid,
     external_timestamp timestamptz,
 
@@ -70,7 +72,8 @@ CREATE TRIGGER accounts_immutable
 --
 -- The row type is also create_transfers()'s input, where every rule is checked and reported
 -- as a code. amount is plain numeric so that a cast into this type can't round a fraction or
--- overflow before those checks see it; the CHECK holds the range numeric(39,0) would.
+-- overflow before those checks see it; the CHECK holds the range numeric(39,0) would. code
+-- is numeric(5,0) like accounts.code, so the cast does round or reject it before then.
 CREATE TABLE @extschema@.transfers (
     id                 uuid        PRIMARY KEY,
     ledger             integer     NOT NULL CHECK (ledger > 0),
@@ -78,7 +81,7 @@ CREATE TABLE @extschema@.transfers (
     credit_account_id  uuid        NOT NULL,
     amount             numeric     NOT NULL
         CHECK (amount > 0 AND amount = trunc(amount) AND amount < 1e39),
-    code               integer     NOT NULL CHECK (code BETWEEN 1 AND 65535),
+    code               numeric(5,0) NOT NULL CHECK (code BETWEEN 1 AND 99999),
     external_id        uuid,
     external_timestamp timestamptz,
 
@@ -173,7 +176,7 @@ BEGIN
                    WHEN t.timestamp IS NOT NULL THEN 'timestamp_must_not_be_set'
                    WHEN t.id IS NULL THEN 'id_not_set'
                    WHEN t.ledger IS NULL OR t.ledger <= 0 THEN 'ledger_invalid'
-                   WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
+                   WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 99999 THEN 'code_invalid'
                    WHEN t.require_credit_balance AND t.require_debit_balance
                        THEN 'flags_are_mutually_exclusive'
                    WHEN a.id IS NOT NULL THEN 'id_already_exists'
@@ -311,7 +314,7 @@ BEGIN
                              ELSE t.amount <= 0 OR t.amount <> trunc(t.amount) OR t.amount >= 1e39
                         END
                        THEN 'amount_must_be_positive'
-                   WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 65535 THEN 'code_invalid'
+                   WHEN t.code IS NULL OR t.code NOT BETWEEN 1 AND 99999 THEN 'code_invalid'
                    WHEN t.debit_account_id = t.credit_account_id
                        THEN 'accounts_must_be_different'
                    WHEN tx.id  IS NOT NULL THEN 'id_already_exists'

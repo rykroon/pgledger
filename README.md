@@ -152,9 +152,9 @@ balancing and already at zero, and `exceeds_debits` otherwise.
 Accounts and transfers both carry three fields that belong to you. The ledger stores
 them but never interprets them:
 
-- `code` (required, positive integer): a category you define, such as an account type from
-  your chart of accounts or a transfer kind (sale, refund, fee). It doesn't reference any
-  table.
+- `code` (required, a number from 1 to 99999): a category you define, such as a 5-digit
+  chart-of-accounts number or a transfer kind (sale, refund, fee). It doesn't reference any
+  table. A fraction is rounded, and 100000 or more fails the whole call.
 - `external_id` (optional `uuid`): links the row to something in your system, e.g. a
   customer, an order, or a group of related transfers.
 - `external_timestamp` (optional `timestamptz`): a time of your own, such as an effective
@@ -201,7 +201,7 @@ transaction already holds and never acquires one out of order.
 - `ledger` must be a positive integer.
 - Transfers cannot cross ledgers, and cannot have the same account on both sides.
 - `amount` must be positive. It may be `NULL` (no cap) only on a balancing transfer.
-- `code` must be positive.
+- `code` must be from 1 to 99999.
 - `timestamp` is assigned by the ledger; supplying it is rejected (`timestamp_must_not_be_set`).
 - An account can require a debit balance or a credit balance, but not both.
 - A transfer that would break a balance rule is rejected.
