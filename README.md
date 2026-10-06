@@ -52,7 +52,7 @@ its first valid copy is created. A retry is safe: accounts that already exist co
 
 Post transfers with `ledger.create_transfers()`, which takes an array of
 `ledger.transfer_input`. The fields are `id, ledger, debit_account_id, credit_account_id,
-amount, code, external_id, external_timestamp, balancing_debit, balancing_credit`. Value flows credit -> debit, so recording a sale debits cash
+amount, code, external_id, external_timestamp, balance_debit_account, balance_credit_account`. Value flows credit -> debit, so recording a sale debits cash
 and credits revenue:
 
 ```sql
@@ -73,7 +73,7 @@ first failed check:
 
 Each accepted transfer is inserted into `ledger.transfers` with two new running-total rows in
 `ledger.account_balances`. A rejected row doesn't stop the others from posting, and a `NULL`
-balancing flag counts as `false`. A batch may span ledgers.
+balance flag counts as `false`. A batch may span ledgers.
 
 Rows post in input order, each against the balances left by the accepted rows before it, so
 order changes outcomes: a deposit followed by a withdrawal can succeed where the reverse is
@@ -119,17 +119,22 @@ balance). The debit account is checked first. The rest of the batch still posts.
 
 ## Balancing transfers
 
-`balancing_debit` and `balancing_credit` on `ledger.transfers` work like TigerBeetle's
-flags of the same names: they make `amount` a maximum rather than an exact amount.
+`balance_debit_account` and `balance_credit_account` on `ledger.transfers` work like
+TigerBeetle's `balancing_debit` and `balancing_credit` flags: they make `amount` a maximum
+rather than an exact amount, so the named account moves toward equal debits and credits.
 
-- `balancing_debit`: move no more than keeps the debit account's debits from exceeding its
-  credits.
-- `balancing_credit`: move no more than keeps the credit account's credits from exceeding
-  its debits.
+- `balance_debit_account`: move no more than brings the debit account's debits up to its
+  credits. The debit account must start with a credit balance.
+- `balance_credit_account`: move no more than brings the credit account's credits up to its
+  debits. The credit account must start with a debit balance.
 - Both: move the smaller of the two.
 
-With either flag, a `NULL` amount means no cap. To pay out whatever a customer's
-credit-normal wallet holds:
+Only the flagged account's balance limits the amount. It ends with equal debits and credits
+when `amount` is `NULL` (no cap) or at least its balance; a smaller `amount` moves just that
+much.
+
+`balance_debit_account` is the common one: spending or paying out up to what a customer's
+credit-normal wallet holds. To pay out all of it:
 
 ```sql
 SELECT * FROM ledger.create_transfers(ARRAY[
@@ -138,13 +143,24 @@ SELECT * FROM ledger.create_transfers(ARRAY[
 ]);
 ```
 
+`balance_credit_account` applies up to what is owed on a debit-normal account. A customer who
+owes 100 on a loan and sends 200 has 100 applied, rather than the loan going to -100:
+
+```sql
+SELECT * FROM ledger.create_transfers(ARRAY[
+    ROW('...transfer-id...', 1, '...cash-id...', '...loan-id...',
+        200, 4, NULL, NULL, false, true)::ledger.transfer_input
+]);
+```
+
 The amount is worked out while posting holds the account locks, against the balance left
 by any earlier rows in the same batch, so there is no read-then-write race to manage. The
 clamp applies whatever balance rules the accounts have, and those rules are still checked
 afterwards. `ledger.transfers.amount` records what actually moved, and the stored
-`balancing_debit` and `balancing_credit` columns record that the transfer was a balancing one.
-If nothing would move, the row is rejected: with `exceeds_credits` if the debit side is
-balancing and already at zero, and `exceeds_debits` otherwise.
+`balance_debit_account` and `balance_credit_account` columns record that the transfer was a
+balancing one. If nothing would move, the row is rejected: with `exceeds_credits` if
+`balance_debit_account` is set and that account has no credit balance, and `exceeds_debits`
+otherwise.
 
 ## Your data on accounts and transfers
 

@@ -79,8 +79,8 @@ CREATE TABLE @extschema@.transfers (
     external_id        uuid,
     external_timestamp timestamptz,
 
-    balancing_debit    boolean     NOT NULL DEFAULT false,
-    balancing_credit   boolean     NOT NULL DEFAULT false,
+    balance_debit_account  boolean NOT NULL DEFAULT false,
+    balance_credit_account boolean NOT NULL DEFAULT false,
 
     CHECK (debit_account_id <> credit_account_id)
 );
@@ -238,8 +238,8 @@ CREATE TYPE @extschema@.transfer_input AS (
     code               numeric,
     external_id        uuid,
     external_timestamp timestamptz,
-    balancing_debit    boolean,
-    balancing_credit   boolean
+    balance_debit_account  boolean,
+    balance_credit_account boolean
 );
 
 -- One row of create_transfers()'s result, in input order. code is 'ok' or the first failed
@@ -250,7 +250,8 @@ CREATE TYPE @extschema@.transfer_input AS (
 --                  credit_account_not_found, debit_account_ledger_mismatch,
 --                  credit_account_ledger_mismatch
 --   balances:      exceeds_credits, exceeds_debits (also a balancing transfer that would move
---                  nothing: exceeds_credits if the debit side is balancing and already at zero)
+--                  nothing: exceeds_credits if balance_debit_account is set and that account
+--                  has no credit balance)
 CREATE TYPE @extschema@.transfer_result AS (
     ord         integer,
     transfer_id uuid,
@@ -258,11 +259,11 @@ CREATE TYPE @extschema@.transfer_result AS (
 );
 
 -- Posts a batch TigerBeetle-style: each row gets its own result and a rejected row doesn't
--- abort the others. The balancing flags
--- make amount a maximum, as in TigerBeetle: balancing_debit moves no more than keeps the debit
--- account's debits from exceeding its credits, balancing_credit no more than keeps the credit
--- account's credits from exceeding its debits, and both take the smaller. With either flag a
--- NULL amount means no cap. A NULL flag counts as false. Phase 2 is one linear walk over in-memory balances in batch order, so a
+-- abort the others. The balance flags make amount a maximum, like TigerBeetle's balancing
+-- flags: balance_debit_account moves no more than brings the debit account's debits up to its
+-- credits, balance_credit_account no more than brings the credit account's credits up to its
+-- debits, and both take the smaller. With either flag a NULL amount means no cap. A NULL flag
+-- counts as false. Phase 2 is one linear walk over in-memory balances in batch order, so a
 -- rejected row never affects later ones. A repeated id posts at most once; later copies get
 -- id_already_exists. A concurrent insert of the same id fails the whole call on the primary key.
 CREATE OR REPLACE FUNCTION @extschema@.create_transfers(inputs @extschema@.transfer_input[])
@@ -330,7 +331,8 @@ BEGIN
                    WHEN t.ledger IS NULL OR t.ledger <= 0 THEN 'ledger_invalid'
                    -- NULL is no cap, allowed only on a balancing transfer.
                    WHEN CASE WHEN t.amount IS NULL
-                             THEN NOT (t.balancing_debit IS TRUE OR t.balancing_credit IS TRUE)
+                             THEN NOT (t.balance_debit_account IS TRUE
+                                       OR t.balance_credit_account IS TRUE)
                              ELSE t.amount <= 0 OR t.amount <> trunc(t.amount) OR t.amount >= 1e39
                         END
                        THEN 'amount_must_be_positive'
@@ -347,7 +349,7 @@ BEGIN
         FROM unnest(inputs) WITH ORDINALITY
              AS t(id, ledger, debit_account_id, credit_account_id,
                   amount, code, external_id, external_timestamp,
-                  balancing_debit, balancing_credit, ord)
+                  balance_debit_account, balance_credit_account, ord)
         -- One index probe per row. As plain joins or an EXISTS, the 10-row unnest estimate
         -- gets hash joins over seq scans of accounts and a hashed subplan over
         -- all of transfers; LIMIT 1 keeps each lookup a parameterized subquery.
@@ -454,18 +456,18 @@ BEGIN
         -- takes the whole available balance.
         -- trunc() drops any trailing zeros (2.0 -> 2); phase 1 ensured a whole number.
         amount      := trunc(candidate.amount);
-        IF candidate.balancing_debit THEN
+        IF candidate.balance_debit_account THEN
             amount := LEAST(amount, GREATEST(0, ranked_balances[debit_rank].credits_posted
                                                 - ranked_balances[debit_rank].debits_posted));
         END IF;
-        IF candidate.balancing_credit THEN
+        IF candidate.balance_credit_account THEN
             amount := LEAST(amount, GREATEST(0, ranked_balances[credit_rank].debits_posted
                                                 - ranked_balances[credit_rank].credits_posted));
         END IF;
         -- Nothing to move: rejected, as in TigerBeetle, with the debit side reported first.
         IF amount = 0 THEN
             results[ord].code := CASE
-                WHEN candidate.balancing_debit
+                WHEN candidate.balance_debit_account
                      AND ranked_balances[debit_rank].credits_posted
                          <= ranked_balances[debit_rank].debits_posted
                     THEN 'exceeds_credits'
@@ -505,8 +507,8 @@ BEGIN
                             candidate.debit_account_id, candidate.credit_account_id,
                             amount,   -- the walk's amount, not the input's
                             candidate.code, candidate.external_id, candidate.external_timestamp,
-                            COALESCE(candidate.balancing_debit,  false),
-                            COALESCE(candidate.balancing_credit, false)
+                            COALESCE(candidate.balance_debit_account,  false),
+                            COALESCE(candidate.balance_credit_account, false)
                            )::@extschema@.transfers;
 
         accepted_count := accepted_count + 1;
