@@ -227,6 +227,23 @@ transaction already holds and never acquires one out of order.
   directly is rejected, even if it has been granted `INSERT`. Grant your app roles
   `EXECUTE` on the functions, not `INSERT` on the tables.
 
+## Tests
+
+`supabase/tests/` holds [pgTAP](https://pgtap.org/) tests, run against the local Supabase
+database, where pgledger is installed through pg_tle exactly as the migrations do it. Each file
+runs in a transaction that rolls back.
+
+```sh
+supabase start
+supabase test db
+```
+
+After editing `pgledger--0.0.1.sql`, regenerate the install migration and reset first:
+
+```sh
+scripts/gen-tle-migration.sh && supabase db reset && supabase test db
+```
+
 ## Benchmark
 
 `bench/` holds a Go program that starts a throwaway `supabase/postgres` container, installs the
