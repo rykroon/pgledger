@@ -1,0 +1,550 @@
+-- pgledger 0.0.1
+-- A double-entry ledger for Postgres, inspired by TigerBeetle (https://docs.tigerbeetle.com/).
+-- Pure SQL/plpgsql so the whole extension can be installed through pg_tle on managed providers.
+--
+-- Ledger tables are append-only: UPDATE, DELETE, and TRUNCATE are blocked by triggers, and
+-- transfers/account_balances additionally reject direct INSERTs so the only way to move money
+-- is through create_transfer()/create_transfers(), which maintain the balance history.
+
+------------------------------------------------------------------------------
+-- uuidv7()
+--
+-- Postgres 17 has no native UUIDv7. Time-ordered ids keep the btree indexes on
+-- these append-only tables packed on the right edge instead of fragmenting the
+-- way random UUIDv4s do. RFC 9562 construction: 48-bit unix-millisecond
+-- timestamp, version and variant bits, random tail from gen_random_uuid().
+------------------------------------------------------------------------------
+
+CREATE FUNCTION uuidv7() RETURNS uuid
+LANGUAGE plpgsql VOLATILE
+AS $$
+DECLARE
+    buf bytea := uuid_send(gen_random_uuid());
+BEGIN
+    -- first 6 bytes: unix epoch milliseconds
+    buf := overlay(buf
+        PLACING substring(int8send((extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3)
+        FROM 1 FOR 6);
+    -- version 7 in the high nibble of byte 6
+    buf := set_byte(buf, 6, (get_byte(buf, 6) & 15) | 112);
+    -- RFC 9562 variant (10xx) in byte 8
+    buf := set_byte(buf, 8, (get_byte(buf, 8) & 63) | 128);
+    RETURN encode(buf, 'hex')::uuid;
+END;
+$$;
+
+------------------------------------------------------------------------------
+-- Tables
+------------------------------------------------------------------------------
+
+CREATE TABLE accounts (
+    id uuid PRIMARY KEY DEFAULT @extschema@.uuidv7(),
+    ledger integer NOT NULL CHECK (ledger > 0),
+    code numeric(5,0) NOT NULL CHECK (code > 0),
+    -- TigerBeetle's debits_must_not_exceed_credits
+    require_credit_balance boolean NOT NULL DEFAULT false,
+    -- TigerBeetle's credits_must_not_exceed_debits
+    require_debit_balance boolean NOT NULL DEFAULT false,
+    external_id uuid,
+    external_timestamp timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (NOT (require_credit_balance AND require_debit_balance)),
+    -- exists so transfers can reference (id, ledger), making the same-ledger
+    -- rule declarative
+    UNIQUE (id, ledger)
+);
+
+CREATE TABLE transfers (
+    id uuid PRIMARY KEY DEFAULT @extschema@.uuidv7(),
+    debit_account_id uuid NOT NULL,
+    credit_account_id uuid NOT NULL,
+    -- scale 0 forbids fractions; zero is allowed because a balancing transfer
+    -- can legitimately resolve to 0
+    amount numeric(39,0) NOT NULL CHECK (amount >= 0),
+    ledger integer NOT NULL,
+    code numeric(5,0) NOT NULL CHECK (code > 0),
+    -- TigerBeetle's balancing_debit
+    balance_debit_account boolean NOT NULL DEFAULT false,
+    -- TigerBeetle's balancing_credit
+    balance_credit_account boolean NOT NULL DEFAULT false,
+    external_id uuid,
+    external_timestamp timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (debit_account_id <> credit_account_id),
+    -- both accounts must live on this transfer's ledger
+    FOREIGN KEY (debit_account_id, ledger) REFERENCES accounts (id, ledger),
+    FOREIGN KEY (credit_account_id, ledger) REFERENCES accounts (id, ledger)
+);
+
+CREATE INDEX transfers_debit_account_id_idx ON transfers (debit_account_id, created_at);
+CREATE INDEX transfers_credit_account_id_idx ON transfers (credit_account_id, created_at);
+
+-- One row per account per transfer: the full balance history, always on.
+-- version is a per-account counter maintained under the account lock, so the
+-- primary key stays well clear of bigint exhaustion no matter how many
+-- accounts exist, and (account_id, version) doubles as the latest-balance
+-- lookup index.
+CREATE TABLE account_balances (
+    account_id uuid NOT NULL REFERENCES accounts (id),
+    version bigint NOT NULL CHECK (version > 0),
+    transfer_id uuid NOT NULL REFERENCES transfers (id),
+    debits_posted numeric(39,0) NOT NULL CHECK (debits_posted >= 0),
+    credits_posted numeric(39,0) NOT NULL CHECK (credits_posted >= 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, version)
+);
+
+------------------------------------------------------------------------------
+-- Immutability and insert protection
+------------------------------------------------------------------------------
+
+CREATE FUNCTION block_mutation() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'pgledger: % on %.% is not allowed; ledger tables are append-only',
+        TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
+END;
+$$;
+
+-- Direct inserts would bypass the locking and balance bookkeeping in
+-- create_transfer(), so transfers and account_balances only accept rows while
+-- the transaction-local pgledger.internal_write flag is set by the API
+-- functions. This is a guard rail against accidents, not a security boundary.
+CREATE FUNCTION block_direct_insert() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF current_setting('pgledger.internal_write', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'pgledger: direct INSERT into %.% is not allowed',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME
+            USING HINT = 'Use create_transfer() or create_transfers(); account_balances rows are maintained automatically.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER accounts_block_mutation
+    BEFORE UPDATE OR DELETE ON accounts
+    FOR EACH ROW EXECUTE FUNCTION block_mutation();
+CREATE TRIGGER accounts_block_truncate
+    BEFORE TRUNCATE ON accounts
+    FOR EACH STATEMENT EXECUTE FUNCTION block_mutation();
+
+CREATE TRIGGER transfers_block_mutation
+    BEFORE UPDATE OR DELETE ON transfers
+    FOR EACH ROW EXECUTE FUNCTION block_mutation();
+CREATE TRIGGER transfers_block_truncate
+    BEFORE TRUNCATE ON transfers
+    FOR EACH STATEMENT EXECUTE FUNCTION block_mutation();
+CREATE TRIGGER transfers_block_direct_insert
+    BEFORE INSERT ON transfers
+    FOR EACH ROW EXECUTE FUNCTION block_direct_insert();
+
+CREATE TRIGGER account_balances_block_mutation
+    BEFORE UPDATE OR DELETE ON account_balances
+    FOR EACH ROW EXECUTE FUNCTION block_mutation();
+CREATE TRIGGER account_balances_block_truncate
+    BEFORE TRUNCATE ON account_balances
+    FOR EACH STATEMENT EXECUTE FUNCTION block_mutation();
+CREATE TRIGGER account_balances_block_direct_insert
+    BEFORE INSERT ON account_balances
+    FOR EACH ROW EXECUTE FUNCTION block_direct_insert();
+
+------------------------------------------------------------------------------
+-- Input types for the batch functions
+--
+-- Fields are unconstrained numeric on purpose: casting into numeric(5,0) /
+-- numeric(39,0) silently rounds, so validation of fractional values happens in
+-- the create functions where it can raise instead.
+------------------------------------------------------------------------------
+
+CREATE TYPE account_input AS (
+    id uuid,
+    ledger integer,
+    code numeric,
+    require_credit_balance boolean,
+    require_debit_balance boolean,
+    external_id uuid,
+    external_timestamp timestamptz
+);
+
+CREATE TYPE transfer_input AS (
+    id uuid,
+    debit_account_id uuid,
+    credit_account_id uuid,
+    amount numeric,
+    code numeric,
+    balance_debit_account boolean,
+    balance_credit_account boolean,
+    external_id uuid,
+    external_timestamp timestamptz
+);
+
+------------------------------------------------------------------------------
+-- Internal helpers
+------------------------------------------------------------------------------
+
+-- Row locks serialize balance updates per account. FOR NO KEY UPDATE does not
+-- conflict with the FOR KEY SHARE locks taken by foreign key checks, so
+-- unrelated transfers never queue behind each other here. Callers must lock
+-- accounts in ascending id order to stay deadlock-free.
+CREATE FUNCTION lock_account(account_id uuid) RETURNS @extschema@.accounts
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+    acct @extschema@.accounts;
+BEGIN
+    SELECT a.* INTO acct
+    FROM @extschema@.accounts a
+    WHERE a.id = lock_account.account_id
+    FOR NO KEY UPDATE OF a;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgledger: account % does not exist', lock_account.account_id;
+    END IF;
+    RETURN acct;
+END;
+$$;
+
+------------------------------------------------------------------------------
+-- Accounts API
+------------------------------------------------------------------------------
+
+CREATE FUNCTION create_account(
+    ledger integer,
+    code numeric,
+    id uuid DEFAULT NULL,
+    require_credit_balance boolean DEFAULT false,
+    require_debit_balance boolean DEFAULT false,
+    external_id uuid DEFAULT NULL,
+    external_timestamp timestamptz DEFAULT NULL
+) RETURNS @extschema@.accounts
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+    acct @extschema@.accounts;
+BEGIN
+    IF create_account.code IS NULL
+        OR create_account.code <= 0
+        OR create_account.code <> trunc(create_account.code) THEN
+        RAISE EXCEPTION 'pgledger: code must be a positive integer, got %', create_account.code;
+    END IF;
+
+    INSERT INTO @extschema@.accounts AS a
+        (id, ledger, code, require_credit_balance, require_debit_balance,
+         external_id, external_timestamp)
+    VALUES (
+        COALESCE(create_account.id, @extschema@.uuidv7()),
+        create_account.ledger,
+        create_account.code,
+        COALESCE(create_account.require_credit_balance, false),
+        COALESCE(create_account.require_debit_balance, false),
+        create_account.external_id,
+        create_account.external_timestamp
+    )
+    RETURNING a.* INTO acct;
+
+    RETURN acct;
+END;
+$$;
+
+CREATE FUNCTION create_accounts(inputs @extschema@.account_input[])
+RETURNS SETOF @extschema@.accounts
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+    input @extschema@.account_input;
+BEGIN
+    IF inputs IS NULL THEN
+        RETURN;
+    END IF;
+    FOREACH input IN ARRAY inputs LOOP
+        RETURN NEXT @extschema@.create_account(
+            ledger => input.ledger,
+            code => input.code,
+            id => input.id,
+            require_credit_balance => COALESCE(input.require_credit_balance, false),
+            require_debit_balance => COALESCE(input.require_debit_balance, false),
+            external_id => input.external_id,
+            external_timestamp => input.external_timestamp
+        );
+    END LOOP;
+    RETURN;
+END;
+$$;
+
+------------------------------------------------------------------------------
+-- Transfers API
+------------------------------------------------------------------------------
+
+CREATE FUNCTION create_transfer(
+    debit_account_id uuid,
+    credit_account_id uuid,
+    amount numeric,
+    code numeric,
+    id uuid DEFAULT NULL,
+    balance_debit_account boolean DEFAULT false,
+    balance_credit_account boolean DEFAULT false,
+    external_id uuid DEFAULT NULL,
+    external_timestamp timestamptz DEFAULT NULL
+) RETURNS @extschema@.transfers
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+    debit_account @extschema@.accounts;
+    credit_account @extschema@.accounts;
+    debit_version bigint;
+    debit_debits numeric;
+    debit_credits numeric;
+    credit_version bigint;
+    credit_debits numeric;
+    credit_credits numeric;
+    posted_amount numeric;
+    transfer @extschema@.transfers;
+BEGIN
+    IF create_transfer.debit_account_id IS NULL OR create_transfer.credit_account_id IS NULL THEN
+        RAISE EXCEPTION 'pgledger: debit_account_id and credit_account_id are required';
+    END IF;
+    IF create_transfer.debit_account_id = create_transfer.credit_account_id THEN
+        RAISE EXCEPTION 'pgledger: cannot transfer between an account and itself (%)',
+            create_transfer.debit_account_id;
+    END IF;
+    IF create_transfer.amount IS NULL
+        OR create_transfer.amount < 0
+        OR create_transfer.amount <> trunc(create_transfer.amount) THEN
+        RAISE EXCEPTION 'pgledger: amount must be a non-negative integer, got %', create_transfer.amount;
+    END IF;
+    IF create_transfer.code IS NULL
+        OR create_transfer.code <= 0
+        OR create_transfer.code <> trunc(create_transfer.code) THEN
+        RAISE EXCEPTION 'pgledger: code must be a positive integer, got %', create_transfer.code;
+    END IF;
+
+    -- Lock both accounts in ascending id order so concurrent transfers over
+    -- the same accounts can never deadlock.
+    IF create_transfer.debit_account_id < create_transfer.credit_account_id THEN
+        debit_account := @extschema@.lock_account(create_transfer.debit_account_id);
+        credit_account := @extschema@.lock_account(create_transfer.credit_account_id);
+    ELSE
+        credit_account := @extschema@.lock_account(create_transfer.credit_account_id);
+        debit_account := @extschema@.lock_account(create_transfer.debit_account_id);
+    END IF;
+
+    IF debit_account.ledger <> credit_account.ledger THEN
+        RAISE EXCEPTION 'pgledger: accounts must be on the same ledger (debit account is on ledger %, credit account is on ledger %)',
+            debit_account.ledger, credit_account.ledger;
+    END IF;
+
+    -- Current balances. The account row locks make these reads race-free.
+    SELECT ab.version, ab.debits_posted, ab.credits_posted
+    INTO debit_version, debit_debits, debit_credits
+    FROM @extschema@.account_balances ab
+    WHERE ab.account_id = debit_account.id
+    ORDER BY ab.version DESC
+    LIMIT 1;
+    debit_version := COALESCE(debit_version, 0);
+    debit_debits := COALESCE(debit_debits, 0);
+    debit_credits := COALESCE(debit_credits, 0);
+
+    SELECT ab.version, ab.debits_posted, ab.credits_posted
+    INTO credit_version, credit_debits, credit_credits
+    FROM @extschema@.account_balances ab
+    WHERE ab.account_id = credit_account.id
+    ORDER BY ab.version DESC
+    LIMIT 1;
+    credit_version := COALESCE(credit_version, 0);
+    credit_debits := COALESCE(credit_debits, 0);
+    credit_credits := COALESCE(credit_credits, 0);
+
+    -- Balancing flags treat amount as a maximum: cap it so the respective
+    -- account's balance is not pushed past zero (floor at 0, like
+    -- TigerBeetle's balancing_debit / balancing_credit).
+    posted_amount := create_transfer.amount;
+    IF COALESCE(create_transfer.balance_debit_account, false) THEN
+        posted_amount := least(posted_amount, greatest(debit_credits - debit_debits, 0));
+    END IF;
+    IF COALESCE(create_transfer.balance_credit_account, false) THEN
+        posted_amount := least(posted_amount, greatest(credit_debits - credit_credits, 0));
+    END IF;
+
+    -- Account balance constraints, checked against the post-transfer balances.
+    IF debit_account.require_credit_balance
+        AND debit_debits + posted_amount > debit_credits THEN
+        RAISE EXCEPTION 'pgledger: transfer would leave account % with debits (%) exceeding credits (%)',
+            debit_account.id, debit_debits + posted_amount, debit_credits
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF credit_account.require_debit_balance
+        AND credit_credits + posted_amount > credit_debits THEN
+        RAISE EXCEPTION 'pgledger: transfer would leave account % with credits (%) exceeding debits (%)',
+            credit_account.id, credit_credits + posted_amount, credit_debits
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    PERFORM set_config('pgledger.internal_write', 'on', true);
+
+    INSERT INTO @extschema@.transfers AS t
+        (id, debit_account_id, credit_account_id, amount, ledger, code,
+         balance_debit_account, balance_credit_account, external_id, external_timestamp)
+    VALUES (
+        COALESCE(create_transfer.id, @extschema@.uuidv7()),
+        debit_account.id,
+        credit_account.id,
+        posted_amount,
+        debit_account.ledger,
+        create_transfer.code,
+        COALESCE(create_transfer.balance_debit_account, false),
+        COALESCE(create_transfer.balance_credit_account, false),
+        create_transfer.external_id,
+        create_transfer.external_timestamp
+    )
+    RETURNING t.* INTO transfer;
+
+    INSERT INTO @extschema@.account_balances
+        (account_id, version, transfer_id, debits_posted, credits_posted, created_at)
+    VALUES
+        (debit_account.id, debit_version + 1, transfer.id,
+         debit_debits + posted_amount, debit_credits, transfer.created_at),
+        (credit_account.id, credit_version + 1, transfer.id,
+         credit_debits, credit_credits + posted_amount, transfer.created_at);
+
+    PERFORM set_config('pgledger.internal_write', 'off', true);
+
+    RETURN transfer;
+END;
+$$;
+
+CREATE FUNCTION create_transfers(inputs @extschema@.transfer_input[])
+RETURNS SETOF @extschema@.transfers
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+    acct_id uuid;
+    input @extschema@.transfer_input;
+BEGIN
+    IF inputs IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- Pre-lock every account the batch touches, in ascending id order, so two
+    -- concurrent batches over overlapping accounts cannot deadlock. The locks
+    -- are held for the rest of the transaction, so the per-transfer locking in
+    -- create_transfer() is then free.
+    FOR acct_id IN
+        SELECT DISTINCT v.account_id
+        FROM unnest(inputs) i,
+             LATERAL (VALUES (i.debit_account_id), (i.credit_account_id)) v(account_id)
+        WHERE v.account_id IS NOT NULL
+        ORDER BY v.account_id
+    LOOP
+        PERFORM @extschema@.lock_account(acct_id);
+    END LOOP;
+
+    -- The whole batch shares the caller's transaction: any failure rolls back
+    -- every transfer in it (TigerBeetle's "linked" behavior).
+    FOREACH input IN ARRAY inputs LOOP
+        RETURN NEXT @extschema@.create_transfer(
+            debit_account_id => input.debit_account_id,
+            credit_account_id => input.credit_account_id,
+            amount => input.amount,
+            code => input.code,
+            id => input.id,
+            balance_debit_account => COALESCE(input.balance_debit_account, false),
+            balance_credit_account => COALESCE(input.balance_credit_account, false),
+            external_id => input.external_id,
+            external_timestamp => input.external_timestamp
+        );
+    END LOOP;
+    RETURN;
+END;
+$$;
+
+------------------------------------------------------------------------------
+-- Lookup and query API
+------------------------------------------------------------------------------
+
+CREATE FUNCTION lookup_account(id uuid) RETURNS SETOF @extschema@.accounts
+LANGUAGE sql STABLE
+SET search_path = ''
+AS $$
+    SELECT a.* FROM @extschema@.accounts a WHERE a.id = lookup_account.id;
+$$;
+
+CREATE FUNCTION lookup_accounts(ids uuid[]) RETURNS SETOF @extschema@.accounts
+LANGUAGE sql STABLE
+SET search_path = ''
+AS $$
+    SELECT a.* FROM @extschema@.accounts a WHERE a.id = ANY (lookup_accounts.ids);
+$$;
+
+CREATE FUNCTION lookup_transfer(id uuid) RETURNS SETOF @extschema@.transfers
+LANGUAGE sql STABLE
+SET search_path = ''
+AS $$
+    SELECT t.* FROM @extschema@.transfers t WHERE t.id = lookup_transfer.id;
+$$;
+
+CREATE FUNCTION lookup_transfers(ids uuid[]) RETURNS SETOF @extschema@.transfers
+LANGUAGE sql STABLE
+SET search_path = ''
+AS $$
+    SELECT t.* FROM @extschema@.transfers t WHERE t.id = ANY (lookup_transfers.ids);
+$$;
+
+-- Latest balance for an account: zero rows if it has no transfers yet.
+CREATE FUNCTION get_account_balance(account_id uuid)
+RETURNS SETOF @extschema@.account_balances
+LANGUAGE sql STABLE
+SET search_path = ''
+AS $$
+    SELECT ab.*
+    FROM @extschema@.account_balances ab
+    WHERE ab.account_id = get_account_balance.account_id
+    ORDER BY ab.version DESC
+    LIMIT 1;
+$$;
+
+-- Balance history for an account, newest first.
+CREATE FUNCTION get_account_balances(
+    account_id uuid,
+    created_after timestamptz DEFAULT NULL,
+    created_before timestamptz DEFAULT NULL,
+    max_rows bigint DEFAULT 100
+) RETURNS SETOF @extschema@.account_balances
+LANGUAGE sql STABLE
+SET search_path = ''
+AS $$
+    SELECT ab.*
+    FROM @extschema@.account_balances ab
+    WHERE ab.account_id = get_account_balances.account_id
+      AND (get_account_balances.created_after IS NULL OR ab.created_at >= get_account_balances.created_after)
+      AND (get_account_balances.created_before IS NULL OR ab.created_at <= get_account_balances.created_before)
+    ORDER BY ab.version DESC
+    LIMIT get_account_balances.max_rows;
+$$;
+
+-- Transfers that debit or credit an account, newest first.
+CREATE FUNCTION get_account_transfers(
+    account_id uuid,
+    created_after timestamptz DEFAULT NULL,
+    created_before timestamptz DEFAULT NULL,
+    max_rows bigint DEFAULT 100
+) RETURNS SETOF @extschema@.transfers
+LANGUAGE sql STABLE
+SET search_path = ''
+AS $$
+    SELECT t.*
+    FROM @extschema@.transfers t
+    WHERE (t.debit_account_id = get_account_transfers.account_id
+           OR t.credit_account_id = get_account_transfers.account_id)
+      AND (get_account_transfers.created_after IS NULL OR t.created_at >= get_account_transfers.created_after)
+      AND (get_account_transfers.created_before IS NULL OR t.created_at <= get_account_transfers.created_before)
+    ORDER BY t.created_at DESC
+    LIMIT get_account_transfers.max_rows;
+$$;
