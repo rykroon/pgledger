@@ -187,24 +187,32 @@ CREATE TYPE transfer_input AS (
 
 -- Row locks serialize balance updates per account. FOR NO KEY UPDATE does not
 -- conflict with the FOR KEY SHARE locks taken by foreign key checks, so
--- unrelated transfers never queue behind each other here. Callers must lock
--- accounts in ascending id order to stay deadlock-free.
-CREATE FUNCTION lock_account(account_id uuid) RETURNS @extschema@.accounts
+-- unrelated transfers never queue behind each other here. ORDER BY is applied
+-- before the locking clause, so rows are locked in ascending id order and two
+-- callers locking overlapping sets can never deadlock. NULL ids are ignored.
+CREATE FUNCTION lock_accounts(ids uuid[]) RETURNS void
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
-    acct @extschema@.accounts;
+    locked bigint;
+    missing uuid;
 BEGIN
-    SELECT a.* INTO acct
+    PERFORM 1
     FROM @extschema@.accounts a
-    WHERE a.id = lock_account.account_id
+    WHERE a.id = ANY (lock_accounts.ids)
+    ORDER BY a.id
     FOR NO KEY UPDATE OF a;
+    GET DIAGNOSTICS locked = ROW_COUNT;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'pgledger: account % does not exist', lock_account.account_id;
+    IF locked < (SELECT count(DISTINCT i) FROM unnest(lock_accounts.ids) i) THEN
+        SELECT i INTO missing
+        FROM unnest(lock_accounts.ids) i
+        WHERE i IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM @extschema@.accounts a WHERE a.id = i)
+        LIMIT 1;
+        RAISE EXCEPTION 'pgledger: account % does not exist', missing;
     END IF;
-    RETURN acct;
 END;
 $$;
 
@@ -212,6 +220,8 @@ $$;
 -- Accounts API
 ------------------------------------------------------------------------------
 
+-- Like create_transfer(), these run as the extension owner so callers need
+-- EXECUTE on them and no grants on the accounts table.
 CREATE FUNCTION create_account(
     ledger integer,
     code numeric,
@@ -222,6 +232,7 @@ CREATE FUNCTION create_account(
     external_timestamp timestamptz DEFAULT NULL
 ) RETURNS @extschema@.accounts
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
@@ -254,6 +265,7 @@ $$;
 CREATE FUNCTION create_accounts(inputs @extschema@.account_input[])
 RETURNS SETOF @extschema@.accounts
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
@@ -281,16 +293,19 @@ $$;
 -- Transfers API
 ------------------------------------------------------------------------------
 
-CREATE FUNCTION create_transfer(
+-- Validates and posts one transfer. Callers must already hold both account
+-- locks (see lock_accounts()); create_transfer() and create_transfers() are
+-- the only entry points, so EXECUTE is revoked from PUBLIC below.
+CREATE FUNCTION post_transfer(
     debit_account_id uuid,
     credit_account_id uuid,
     amount numeric,
     code numeric,
-    id uuid DEFAULT NULL,
-    balance_debit_account boolean DEFAULT false,
-    balance_credit_account boolean DEFAULT false,
-    external_id uuid DEFAULT NULL,
-    external_timestamp timestamptz DEFAULT NULL
+    id uuid,
+    balance_debit_account boolean,
+    balance_credit_account boolean,
+    external_id uuid,
+    external_timestamp timestamptz
 ) RETURNS @extschema@.transfers
 LANGUAGE plpgsql
 SET search_path = ''
@@ -307,32 +322,33 @@ DECLARE
     posted_amount numeric;
     transfer @extschema@.transfers;
 BEGIN
-    IF create_transfer.debit_account_id IS NULL OR create_transfer.credit_account_id IS NULL THEN
+    IF post_transfer.debit_account_id IS NULL OR post_transfer.credit_account_id IS NULL THEN
         RAISE EXCEPTION 'pgledger: debit_account_id and credit_account_id are required';
     END IF;
-    IF create_transfer.debit_account_id = create_transfer.credit_account_id THEN
+    IF post_transfer.debit_account_id = post_transfer.credit_account_id THEN
         RAISE EXCEPTION 'pgledger: cannot transfer between an account and itself (%)',
-            create_transfer.debit_account_id;
+            post_transfer.debit_account_id;
     END IF;
-    IF create_transfer.amount IS NULL
-        OR create_transfer.amount < 0
-        OR create_transfer.amount <> trunc(create_transfer.amount) THEN
-        RAISE EXCEPTION 'pgledger: amount must be a non-negative integer, got %', create_transfer.amount;
+    IF post_transfer.amount IS NULL
+        OR post_transfer.amount < 0
+        OR post_transfer.amount <> trunc(post_transfer.amount) THEN
+        RAISE EXCEPTION 'pgledger: amount must be a non-negative integer, got %', post_transfer.amount;
     END IF;
-    IF create_transfer.code IS NULL
-        OR create_transfer.code <= 0
-        OR create_transfer.code <> trunc(create_transfer.code) THEN
-        RAISE EXCEPTION 'pgledger: code must be a positive integer, got %', create_transfer.code;
+    IF post_transfer.code IS NULL
+        OR post_transfer.code <= 0
+        OR post_transfer.code <> trunc(post_transfer.code) THEN
+        RAISE EXCEPTION 'pgledger: code must be a positive integer, got %', post_transfer.code;
     END IF;
 
-    -- Lock both accounts in ascending id order so concurrent transfers over
-    -- the same accounts can never deadlock.
-    IF create_transfer.debit_account_id < create_transfer.credit_account_id THEN
-        debit_account := @extschema@.lock_account(create_transfer.debit_account_id);
-        credit_account := @extschema@.lock_account(create_transfer.credit_account_id);
-    ELSE
-        credit_account := @extschema@.lock_account(create_transfer.credit_account_id);
-        debit_account := @extschema@.lock_account(create_transfer.debit_account_id);
+    -- The caller holds both account locks, so plain reads are race-free.
+    SELECT a.* INTO debit_account
+    FROM @extschema@.accounts a WHERE a.id = post_transfer.debit_account_id;
+    SELECT a.* INTO credit_account
+    FROM @extschema@.accounts a WHERE a.id = post_transfer.credit_account_id;
+    IF debit_account.id IS NULL OR credit_account.id IS NULL THEN
+        RAISE EXCEPTION 'pgledger: account % does not exist',
+            CASE WHEN debit_account.id IS NULL THEN post_transfer.debit_account_id
+                 ELSE post_transfer.credit_account_id END;
     END IF;
 
     IF debit_account.ledger <> credit_account.ledger THEN
@@ -364,11 +380,11 @@ BEGIN
     -- Balancing flags treat amount as a maximum: cap it so the respective
     -- account's balance is not pushed past zero (floor at 0, like
     -- TigerBeetle's balancing_debit / balancing_credit).
-    posted_amount := create_transfer.amount;
-    IF COALESCE(create_transfer.balance_debit_account, false) THEN
+    posted_amount := post_transfer.amount;
+    IF COALESCE(post_transfer.balance_debit_account, false) THEN
         posted_amount := least(posted_amount, greatest(debit_credits - debit_debits, 0));
     END IF;
-    IF COALESCE(create_transfer.balance_credit_account, false) THEN
+    IF COALESCE(post_transfer.balance_credit_account, false) THEN
         posted_amount := least(posted_amount, greatest(credit_debits - credit_credits, 0));
     END IF;
 
@@ -392,16 +408,16 @@ BEGIN
         (id, debit_account_id, credit_account_id, amount, ledger, code,
          balance_debit_account, balance_credit_account, external_id, external_timestamp)
     VALUES (
-        COALESCE(create_transfer.id, @extschema@.uuidv7()),
+        COALESCE(post_transfer.id, @extschema@.uuidv7()),
         debit_account.id,
         credit_account.id,
         posted_amount,
         debit_account.ledger,
-        create_transfer.code,
-        COALESCE(create_transfer.balance_debit_account, false),
-        COALESCE(create_transfer.balance_credit_account, false),
-        create_transfer.external_id,
-        create_transfer.external_timestamp
+        post_transfer.code,
+        COALESCE(post_transfer.balance_debit_account, false),
+        COALESCE(post_transfer.balance_credit_account, false),
+        post_transfer.external_id,
+        post_transfer.external_timestamp
     )
     RETURNING t.* INTO transfer;
 
@@ -418,45 +434,77 @@ BEGIN
     RETURN transfer;
 END;
 $$;
+REVOKE EXECUTE ON FUNCTION post_transfer(
+    uuid, uuid, numeric, numeric, uuid, boolean, boolean, uuid, timestamptz) FROM PUBLIC;
+
+-- create_transfer() and create_transfers() run as the extension owner so they
+-- can call post_transfer(); callers need EXECUTE on these and nothing else.
+-- search_path is pinned to '' and every reference is schema-qualified, which
+-- keeps SECURITY DEFINER safe from search_path hijacking.
+CREATE FUNCTION create_transfer(
+    debit_account_id uuid,
+    credit_account_id uuid,
+    amount numeric,
+    code numeric,
+    id uuid DEFAULT NULL,
+    balance_debit_account boolean DEFAULT false,
+    balance_credit_account boolean DEFAULT false,
+    external_id uuid DEFAULT NULL,
+    external_timestamp timestamptz DEFAULT NULL
+) RETURNS @extschema@.transfers
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+    PERFORM @extschema@.lock_accounts(
+        ARRAY[create_transfer.debit_account_id, create_transfer.credit_account_id]);
+    RETURN @extschema@.post_transfer(
+        debit_account_id => create_transfer.debit_account_id,
+        credit_account_id => create_transfer.credit_account_id,
+        amount => create_transfer.amount,
+        code => create_transfer.code,
+        id => create_transfer.id,
+        balance_debit_account => create_transfer.balance_debit_account,
+        balance_credit_account => create_transfer.balance_credit_account,
+        external_id => create_transfer.external_id,
+        external_timestamp => create_transfer.external_timestamp
+    );
+END;
+$$;
 
 CREATE FUNCTION create_transfers(inputs @extschema@.transfer_input[])
 RETURNS SETOF @extschema@.transfers
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
-    acct_id uuid;
     input @extschema@.transfer_input;
 BEGIN
     IF inputs IS NULL THEN
         RETURN;
     END IF;
 
-    -- Pre-lock every account the batch touches, in ascending id order, so two
-    -- concurrent batches over overlapping accounts cannot deadlock. The locks
-    -- are held for the rest of the transaction, so the per-transfer locking in
-    -- create_transfer() is then free.
-    FOR acct_id IN
-        SELECT DISTINCT v.account_id
+    -- Lock every account the batch touches up front, in one ordered statement,
+    -- so two concurrent batches over overlapping accounts cannot deadlock. The
+    -- locks are held for the rest of the transaction.
+    PERFORM @extschema@.lock_accounts(ARRAY(
+        SELECT v.account_id
         FROM unnest(inputs) i,
-             LATERAL (VALUES (i.debit_account_id), (i.credit_account_id)) v(account_id)
-        WHERE v.account_id IS NOT NULL
-        ORDER BY v.account_id
-    LOOP
-        PERFORM @extschema@.lock_account(acct_id);
-    END LOOP;
+             LATERAL (VALUES (i.debit_account_id), (i.credit_account_id)) v(account_id)));
 
     -- The whole batch shares the caller's transaction: any failure rolls back
     -- every transfer in it (TigerBeetle's "linked" behavior).
     FOREACH input IN ARRAY inputs LOOP
-        RETURN NEXT @extschema@.create_transfer(
+        RETURN NEXT @extschema@.post_transfer(
             debit_account_id => input.debit_account_id,
             credit_account_id => input.credit_account_id,
             amount => input.amount,
             code => input.code,
             id => input.id,
-            balance_debit_account => COALESCE(input.balance_debit_account, false),
-            balance_credit_account => COALESCE(input.balance_credit_account, false),
+            balance_debit_account => input.balance_debit_account,
+            balance_credit_account => input.balance_credit_account,
             external_id => input.external_id,
             external_timestamp => input.external_timestamp
         );

@@ -15,7 +15,7 @@ SELECT col_type_is('ledger', 'account_balances', 'version', 'bigint', 'account_b
 SELECT col_is_pk('ledger', 'account_balances', ARRAY['account_id', 'version']);
 
 SELECT has_function('ledger'::name, 'uuidv7'::name);
-SELECT has_function('ledger'::name, 'lock_account'::name);
+SELECT has_function('ledger'::name, 'lock_accounts'::name);
 SELECT has_function('ledger'::name, 'create_account'::name);
 SELECT has_function('ledger'::name, 'create_accounts'::name);
 SELECT has_function('ledger'::name, 'create_transfer'::name);
