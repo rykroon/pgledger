@@ -77,3 +77,37 @@ scripts/gen-tle-migration.sh   # after editing pgledger--0.0.1.sql
 supabase db reset              # install the extension + seed
 supabase test db               # pgTAP suite in supabase/tests/
 ```
+
+## Benchmarking
+
+`bench/` holds a Go load generator that measures write throughput (transfers/second) through
+`create_transfers()`. `bench/run.sh` starts a throwaway `postgres:17` container (2 CPUs, 6 GiB —
+TigerBeetle's replica minimum) with this repo's extension files mounted in, runs the benchmark,
+and removes the container. Arguments pass straight through:
+
+```sh
+bench/run.sh                                   # 16 clients, batches of 100, 100k transfers
+bench/run.sh -clients 32 -batch 50 -hot-ratio 0.5
+KEEP=1 PG_ARGS="-c synchronous_commit=off" bench/run.sh -transfers 1000000
+```
+
+| flag | default | |
+|---|---|---|
+| `-clients` | 16 | concurrent connections |
+| `-batch` | 100 | transfers per `create_transfers()` call |
+| `-hot-ratio` | 0 | fraction of transfers touching a hot account (0 = uniform random, 1 = all) |
+| `-transfers` | 100000 | total transfers |
+| `-accounts` | 10000 | accounts created up front |
+| `-hot-accounts` | 1 | size of the hot set |
+| `-reset` | true | drop and reinstall the extension first |
+| `-seed` | clock | RNG seed |
+| `-progress` | 1s | progress interval (0 disables) |
+| `-verify` | true | afterwards, check the transfer count and that every account balance matches its transfers |
+
+Container knobs are environment variables: `PG_IMAGE`, `PG_PORT` (54329), `PG_CPUS`,
+`PG_MEMORY`, `PG_ARGS`, `KEEP=1`.
+
+Caveats: on macOS every round trip crosses Docker Desktop's VM, so larger batches amortize
+that overhead; compare runs on the same machine rather than reading absolute numbers. A batch
+locks every account it touches for its whole transaction, so with large batches even a
+"random" workload contends across clients.
