@@ -14,19 +14,20 @@ Some design goals to consider:
 
 ## Immutability
 - Tables must be INSERT only. UPDATES and DELETES should fail.
-- This can best be done using a BEFORE trigger.
+  - This can best be done using a BEFORE trigger.
+- Users should not be allowed to directly insert into transfers and account_balances.
 
 ## Postgres First
 - Do not force Tigerbeetle implementations that do not make sense within the context of Postgres. 
 - For example, in Tigerbeele, there is strict serializability (single-threaded and timestamps are unique). Postgres being concurrent should not force strict serializability. But should at least be robust and prevent race conditions and deadlocks when updating account balances.
 
-## Tigerbeetle Flags and Featurs:
+## Tigerbeetle Flags and Features:
 Tigerbeetle has various features that are implemented by setting certain flags on accounts and transfers. I only want the following to be implemented.
 
 ### Account Flags
 - only the debits_must_not_exceed_credits and credits_must_not_exceed_debits flags should be implemented.
   - However they should be called require_credit_balance and require_debit_balance.
-- There will be no history flag, but all accounts should have their historical balances accounted for. So the only setting would be similar to history=true. This is because of the strict immutability. having history=false would mean updating a table.
+- There will be no history flag, but all accounts should have their historical balances accounted for. So the implementation would be similar to history=true. This is because of the strict immutability. Having history=false would mean updating a table.
 
 
 ### Transfer Flags
@@ -34,7 +35,7 @@ Tigerbeetle has various features that are implemented by setting certain flags o
   - They should be called balance_debit_account and balance_credit_account.
 
 - Two phase transfers and imports can be ignored.
-- We should implement something that behaves similarly to linked where transfers all succeed or fail together, but that just sounds like a Postgres transaction. so that doesn't need to be planned in the forefront.
+- The default behavior of creating a batch of tranfers should be as if they are all "linked", meaning they all succeed or they all fail.
 
 ## Schema design
 
@@ -49,7 +50,7 @@ There should be atleast the following three tables.
 There isn't a perfect mapping from Tigerbeetle data types to Postgres data types so tradeoffs will have to be made.
 
 #### Ids
-- In tigerbeetle ids are uint128, I think it is pretty fitting to have ids as a Postgres UUID type since those are also uint128
+- In tigerbeetle ids are uint128, I think it is pretty fitting to have ids as a Postgres UUID type since those are also uint128.
 
 #### timestamp
 - In tigerbeetle a timestamp is uint64 representing the number of microseconds since the unix epoch.
@@ -61,8 +62,8 @@ There isn't a perfect mapping from Tigerbeetle data types to Postgres data types
 
 #### Ledger and Code
 - In Tigerbeetle ledgers are uint32 and codes are uint16.
-- I am thinking that a ledger can be bigint or even int (must be positive).
-- For codes, at first glance smallint makes sense when looking to make it tigerbeetle like, but for say accounts, there is already a "chart of accounts" standard where account codes are often 3, 5, or even 7 digit codes. See here: https://www.accountingcoach.com/chart-of-accounts/explanation - So I am compelled to make codes numeric(5,0).
+- I am thinking that a ledger can be int (must be positive). This gives us 2^31-1 ledgers.
+- For codes, at first glance smallint makes sense when looking to make it tigerbeetle like, but for say accounts, there is already a standard for "chart of accounts" where account codes are often 3, 5, or even 7 digit codes. See here: https://www.accountingcoach.com/chart-of-accounts/explanation - So I am compelled to make codes numeric(5,0).
 
 
 #### User Data
@@ -72,7 +73,6 @@ There isn't a perfect mapping from Tigerbeetle data types to Postgres data types
 
 
 # Performance
-
 pgledger is not meant to be nearly as performant as Tigerbeetle. Tigerbeetle only exists because you couldn't realistically get the same kind of performance from a general purpose database.
 
 Tigerbeetle advertises 100K-500K TPS on their homepage. If pgledger can achieve atleast a tenth of that speed that would be pretty impressive.
